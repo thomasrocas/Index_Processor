@@ -49,6 +49,7 @@
         <option value="" disabled selected>-- Choose a table --</option>
         <option value="casemanager">Case Manager</option>
         <option value="maintable">Main Table</option>
+        <option value="billed_ar_aging">Billed AR Aging</option>
         <!-- ✅ FIX: send correct table name for Unduplicated importer -->
         <option value="unduplicatedpatients">Unduplicated Census</option>
       </select>
