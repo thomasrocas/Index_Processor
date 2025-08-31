@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>CSV Upload</title>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      background: #f7f9fc;
+      margin: 0;
+      padding: 40px;
+    }
+    .container {
+      max-width: 520px;
+      margin: auto;
+      background: #fff;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+    }
+    h2 { text-align: center; margin-top: 0; }
+    label { display: block; margin: 15px 0 5px; }
+    select, input[type="file"], button {
+      width: 100%;
+      padding: 10px;
+      border-radius: 8px;
+      border: 1px solid #ccc;
+      font-size: 14px;
+    }
+    button {
+      background: #007bff;
+      color: white;
+      border: none;
+      cursor: pointer;
+      margin-top: 20px;
+    }
+    button:hover { background: #0056b3; }
+    #status { margin-top: 16px; font-weight: bold; white-space: pre-wrap; }
+    .muted { color: #555; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Upload CSV to Database</h2>
+    <form id="uploadForm" enctype="multipart/form-data">
+      <label for="tableName">Select Table:</label>
+      <select name="tableName" id="tableName" required>
+        <option value="" disabled selected>-- Choose a table --</option>
+        <option value="casemanager">Case Manager</option>
+        <option value="maintable">Main Table</option>
+        <!-- ✅ FIX: send correct table name for Unduplicated importer -->
+        <option value="unduplicatedpatients">Unduplicated Census</option>
+      </select>
+
+      <label for="csvFile">Choose CSV File:</label>
+      <input type="file" name="csvfile" id="csvFile" accept=".csv" required>
+
+      <button type="submit">Upload</button>
+    </form>
+    <div class="muted">Tip: Main Table requires a "Visit ID". Unduplicated requires "MRN".</div>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const form = document.getElementById("uploadForm");
+    const statusBox = document.getElementById("status");
+
+    form.addEventListener("submit", function(e) {
+      e.preventDefault();
+      const tableName = document.getElementById("tableName").value;
+      const fileInput = document.getElementById("csvFile");
+      const file = fileInput.files[0];
+      if (!file) return alert("Please select a file.");
+
+      // Show which table name will be sent (sanity check)
+      statusBox.textContent = "Uploading to table: " + tableName + "\n";
+
+      if (tableName === "maintable") {
+        processAndUploadCSV(file, tableName);
+      } else {
+        uploadDirect(file, tableName);
+      }
+    });
+
+    function uploadDirect(file, tableName) {
+      const formData = new FormData();
+      formData.append("csvfile", file);
+      formData.append("tableName", tableName);
+
+      fetch("/upload", { method: "POST", body: formData })
+        .then(res => res.text())
+        .then(msg => statusBox.textContent += msg)
+        .catch(err => statusBox.textContent += "❌ Error: " + err);
+    }
+
+    // Only for Main Table pre-processing (recert date columns)
+    function processAndUploadCSV(file, tableName) {
+      Papa.parse(file, {
+        complete: function(results) {
+          let data = results.data;
+
+          // Remove blank header columns
+          for (let col = data[0].length - 1; col >= 0; col--) {
+            if ((data[0][col] || "").trim() === "") {
+              data.forEach(row => {
+                if (row.length > col) row.splice(col, 1);
+              });
+            }
+          }
+
+          // ✅ FIX: Trim both left and right whitespace on headers
+          data[0] = data[0].map(h => (h || "").trim());
+
+          const socDateIndex = data[0].indexOf("SOC Date");
+          const visitStartDateIndex = data[0].indexOf("Visit Start Date");
+
+          // Add computed headers
+          data[0].push("cRecertDate_Current", "cRecertDate_Next", "cRecertDate_End");
+
+          for (let i = 1; i < data.length; i++) {
+            const socDate = parseDate(data[i][socDateIndex]);
+            const visitStartDate = parseDate(data[i][visitStartDateIndex]);
+
+            let cRecertDateCurrent = "", cRecertDateNext = "", cRecertDateEnd = "";
+
+            if (socDate && visitStartDate && socDate <= visitStartDate) {
+              const recertDate = calculateCRecertDate(socDate, visitStartDate);
+              if (recertDate) {
+                const recertDateNext = new Date(recertDate.getTime());
+                recertDateNext.setDate(recertDateNext.getDate() + 1);
+
+                const recertDateEnd = new Date(recertDate.getTime());
+                recertDateEnd.setDate(recertDateEnd.getDate() + 59);
+
+                cRecertDateCurrent = formatDate(recertDate);
+                cRecertDateNext = formatDate(recertDateNext);
+                cRecertDateEnd = formatDate(recertDateEnd);
+              }
+            }
+
+            data[i].push(cRecertDateCurrent, cRecertDateNext, cRecertDateEnd);
+          }
+
+          // Turn back into CSV string
+          const modifiedCSV = Papa.unparse(data);
+          const blob = new Blob([modifiedCSV], { type: "text/csv" });
+          const processedFile = new File([blob], "processed_" + file.name, { type: "text/csv" });
+
+          // Upload processed file
+          uploadDirect(processedFile, tableName);
+        }
+      });
+    }
+
+    function calculateCRecertDate(socDate, visitStartDate) {
+      let cRecertDateCurrent = new Date(socDate.getTime());
+      let nextSOCDate = new Date(socDate.getTime());		
+      while (nextSOCDate <= visitStartDate) {
+        cRecertDateCurrent = new Date(nextSOCDate.getTime());
+        nextSOCDate.setDate(nextSOCDate.getDate() + 60);
+      }
+      return cRecertDateCurrent;
+    }
+
+    function parseDate(dateStr) {
+      let date = new Date(dateStr);
+      return isNaN(date) ? null : date;
+    }
+
+    function formatDate(date) {
+      return date ? `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}/${date.getFullYear()}` : "";
+    }
+  </script>
+</body>
+</html>
