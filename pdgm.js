@@ -1,0 +1,1105 @@
+const express = require('express');
+const { Client } = require('pg');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
+const { parse } = require('csv-parse');
+const { stringify } = require('csv-stringify');
+const copyFrom = require('pg-copy-streams').from;
+const { Transform } = require('stream');
+
+const app = express();
+const PORT = 3000;
+
+const client = new Client({
+  user: 'postgres',
+  host: 'localhost',
+  database: 'clinicalvisits',
+  password: '@DbAdmin@',
+  port: 5432,
+});
+
+client.connect()
+  .then(() => console.log('✅ Connected to PostgreSQL!'))
+  .catch(err => console.error('❌ PostgreSQL connection error', err));
+
+const upload = multer({ dest: 'uploads/' });
+app.use(express.static('public'));
+app.use(express.urlencoded({ extended: true }));
+
+// ------------------ Helpers ------------------
+function toNullIfEmpty(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+
+const CSV_OPTS_TOLERANT = {
+  columns: true,
+  trim: true,
+  skip_empty_lines: true,
+  relax_column_count: true,   // ✅ accept short/long rows
+  relax_quotes: true,         // ✅ handle stray quotes
+  bom: true,                  // ✅ handle UTF-8 BOM
+  skip_lines_with_error: true // ✅ silently skip broken lines
+};
+
+// Normalize common date strings to YYYY-MM-DD.
+// If a range like "10/30/2022 - 11/5/2022" appears, take the first date.
+function normalizeDateForPg(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (s === '') return null;
+  const m = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) {
+    const mm = String(parseInt(m[1], 10)).padStart(2,'0');
+    const dd = String(parseInt(m[2], 10)).padStart(2,'0');
+    let yy = m[3];
+    let yyyy = yy.length === 2 ? (parseInt(yy,10) < 70 ? '20' + yy : '19' + yy) : yy;
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  const d = new Date(s);
+  if (!isNaN(d)) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth()+1).padStart(2,'0');
+    const dd = String(d.getDate()).padStart(2,'0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return null;
+}
+
+async function ensureBilledArAgingConstraint() {
+  const check = await client.query(`
+    SELECT tc.constraint_name
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.constraint_column_usage ccu
+      ON tc.constraint_name = ccu.constraint_name AND tc.table_name = ccu.table_name
+    WHERE tc.table_schema = 'public'
+      AND tc.table_name = 'billed_ar_aging'
+      AND tc.constraint_type = 'UNIQUE'
+      AND ccu.column_name IN ('Service Dates','Med Rec #','Invoice Num')
+    GROUP BY tc.constraint_name
+    HAVING COUNT(*) = 3
+  `);
+  if (check.rowCount === 0) {
+    await client.query(`
+      ALTER TABLE "billed_ar_aging"
+      ADD CONSTRAINT billed_ar_aging_unique UNIQUE("Service Dates", "Med Rec #", "Invoice Num")
+    `);
+  }
+}
+
+async function ensureQueueManagerConstraint() {
+  const check = await client.query(`
+    SELECT tc.constraint_name
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.constraint_column_usage ccu
+      ON tc.constraint_name = ccu.constraint_name AND tc.table_name = ccu.table_name
+    WHERE tc.table_schema = 'public'
+      AND tc.table_name = 'queue_manager'
+      AND tc.constraint_type IN ('UNIQUE','PRIMARY KEY')
+      AND ccu.column_name = 'QueueID'
+  `);
+  if (check.rowCount === 0) {
+    await client.query(`
+      ALTER TABLE "queue_manager"
+      ADD CONSTRAINT queue_manager_queueid_uniq UNIQUE("QueueID")
+    `);
+  }
+}
+
+
+async function ensureActiveAgencyConstraint() {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'active_agency'
+          AND indexname = 'active_agency_admission_id_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX active_agency_admission_id_uniq
+                 ON public.active_agency("Admission ID")';
+      END IF;
+    END$$;
+  `);
+}
+
+
+async function ensurePdgmConstraint() {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'pdgm'
+          AND indexname = 'pdgm_admission_id_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX pdgm_admission_id_uniq
+                 ON public.pdgm("Admission ID")';
+      END IF;
+    END$$;
+  `);
+}
+
+
+
+// ---------- Logging Helpers ----------
+const LOG_FILE = path.join(__dirname, 'maintable_log.txt');
+
+async function ensureLogFileExists() {
+  try {
+    await fs.promises.access(LOG_FILE, fs.constants.F_OK);
+  } catch {
+    await fs.promises.writeFile(
+      LOG_FILE,
+      "Datetime | User | Processed | Inserted/Updated | Deleted | Skipped\n",
+      { encoding: "utf8" }
+    );
+  }
+}
+
+function resolveOsUser() {
+  const envUser =
+    process.env.SUDO_USER ||
+    process.env.USER ||
+    process.env.USERNAME ||
+    process.env.LOGNAME;
+  if (envUser) return envUser;
+
+  try {
+    return require('os').userInfo().username;
+  } catch {
+    return null;
+  }
+}
+
+function resolveActor(req) {
+  return (
+    (req.body && (req.body.username || req.body.user || req.body.createdBy)) ||
+    (req.user && (req.user.username || req.user.email || req.user.id)) ||
+    req.headers["x-forwarded-user"] ||
+    resolveOsUser() ||
+    req.ip ||
+    "unknown"
+  );
+}
+
+async function appendImportLog(actor, summary, funcName) {
+  await ensureLogFileExists();
+  const line = [
+    new Date().toISOString(),
+    actor,
+    funcName,
+    summary.processedRows,
+    summary.insertedOrUpdated,
+    summary.deletedCount,
+    summary.skippedRows
+  ].join(" | ") + "\n";
+
+  await fs.promises.appendFile(LOG_FILE, line, { encoding: "utf8" });
+}
+
+
+
+// ------------------ ROUTES ------------------
+app.post('/upload', upload.single('csvfile'), async (req, res) => {
+  const tableNameRaw = req.body.tableName;
+  const tableName = (tableNameRaw ?? '').toString().trim().toLowerCase();
+  const filePath = req.file?.path;
+
+  if (!filePath) return res.status(400).send('No file uploaded.');
+  if (!tableName) {
+    fs.unlinkSync(filePath);
+    return res.status(400).send('No table selected.');
+  }
+
+  try {
+if (tableName === 'casemanager') {
+  await importCaseManager(filePath, tableName, res);
+  const actor = resolveActor(req);
+  // importCaseManager doesn’t return summary → log placeholder
+  await appendImportLog(actor, { processedRows: 0, insertedOrUpdated: 0, deletedCount: 0, skippedRows: 0 }, "importCaseManager");
+
+} else if (tableName === 'maintable') {
+  const summary = await importMainTable(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importMainTable");
+
+  return res.send(`
+    ✅ MainTable Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+} else if (tableName === 'unduplicatedpatients') {
+  const summary = await importUnduplicatedPatients(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importUnduplicatedPatients");
+
+  return res.send(`
+    ✅ UnduplicatedPatients Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+  } else if (tableName === 'active_agency') {
+  const summary = await importActiveAgency(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importActiveAgency");
+
+  return res.send(`
+    ✅ Import ActiveAgency Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+
+  } else if (tableName === 'pdgm') {
+  const summary = await importPdgm(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importPdgm");
+
+  return res.send(`
+    ✅ Import PDGM Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+} else if (tableName === 'billed_ar_aging') {
+  const summary = await importBilledArAging(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importBilledArAging");
+ // Belt-and-suspenders: ensure RFNP is synced after the import
+  await client.query('SELECT public.refresh_all_rollups()');
+
+  return res.send(`
+    ✅ Billed AR Aging Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+} else if (tableName === 'queue_manager') {
+  const summary = await importQueueManager(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importQueueManager");
+  // Ensure RFNP reflects any QM changes from this batch
+  await client.query('SELECT public.refresh_all_rollups()');
+  
+  return res.send(`
+    ✅ Queue Manager Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+}
+ else {
+      fs.unlinkSync(filePath);
+      return res.status(400).send('❌ Unknown table selected.');
+    }
+  } catch (err) {
+    console.error('❌ Server error:', err);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    res.status(500).send(`<pre>Server error: ${err.message}</pre>`);
+  }
+});
+
+// ------------------ CASEMANAGER IMPORT ------------------
+async function importCaseManager(filePath, tableName, res) {
+  try {
+    const result = await client.query(`
+      SELECT column_name, data_type
+      FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = $1
+      ORDER BY ordinal_position
+    `, [tableName]);
+
+    const tableColumns = result.rows.map(r => `"${r.column_name}"`);
+    const columnTypes = {};
+    result.rows.forEach(r => { columnTypes[r.column_name] = r.data_type; });
+
+    await client.query(`TRUNCATE TABLE "${tableName}"`);
+
+    function normalizeDate(v) {
+      if (!v) return '';
+      const d = new Date(v);
+      return isNaN(d) ? '' : d.toISOString().split('T')[0];
+    }
+
+    const isDateCol = {};
+    for (const [name, typ] of Object.entries(columnTypes)) {
+      isDateCol[name] = /\bdate\b/i.test(typ);
+    }
+
+    const reorderAndSanitize = new Transform({
+      writableObjectMode: true,
+      readableObjectMode: true,
+      transform(record, _enc, cb) {
+        const out = [];
+        for (const col of tableColumns) {
+          const plain = col.replace(/(^")|("$)/g, '');
+          let v = record[plain] ?? '';
+          if (isDateCol[plain]) v = normalizeDate(v);
+          out.push(v);
+        }
+        cb(null, out);
+      }
+    });
+
+    const copyStream = client.query(copyFrom(
+      `COPY "${tableName}" (${tableColumns.join(',')}) FROM STDIN CSV NULL ''`
+    ));
+
+    fs.createReadStream(filePath)
+      .pipe(parse({ columns: true, trim: true }))
+      .pipe(reorderAndSanitize)
+      .pipe(stringify({ header: false }))
+      .pipe(copyStream)
+      .on('finish', () => {
+        fs.unlinkSync(filePath);
+        res.send(`✅ CaseManager: Table "${tableName}" imported successfully!`);
+      })
+      .on('error', err => { copyStream.destroy(err); });
+
+  } catch (err) {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ MAINTABLE IMPORT ------------------
+async function importMainTable(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvVisitIds = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => c !== 'Visit ID');
+  dateColumn = allColumns.find(c => /date/i.test(c));
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const visitId = row['Visit ID'];
+      const action = (row['Action'] || '').toUpperCase();
+      const dateStr = dateColumn ? row[dateColumn] : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!visitId) {
+        skippedRows.push({ row, reason: 'Missing Visit ID' });
+        continue;
+      }
+
+      csvVisitIds.add(visitId);
+
+      if (action === 'DELETE') {
+        deleteIds.add(visitId);
+        continue; // Skip upsert for deletions
+      }
+
+      const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
+      batch.push({ keys: [visitId], rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, ['Visit ID']);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, ['Visit ID']);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "Visit ID" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvVisitIds.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND "Visit ID" NOT IN (SELECT unnest($3::text[]))`,
+        [minDate, maxDate, Array.from(csvVisitIds)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+async function processBatch(batch, tableName, tableColumns, keyColumns) {
+  const keys = Array.isArray(keyColumns) ? keyColumns : [keyColumns];
+  const dedupedMap = new Map();
+  for (const item of batch) {
+    const keyString = item.keys.join('|');
+    dedupedMap.set(keyString, { keys: item.keys, rowData: item.rowData });
+  }
+
+  const dedupedBatch = Array.from(dedupedMap.values());
+
+  const values = [];
+  let paramIdx = 1;
+  const placeholders = dedupedBatch.map(b => {
+    const rowPlaceholders = [];
+    for (let i = 0; i < keys.length + tableColumns.length; i++) {
+      rowPlaceholders.push(`$${paramIdx++}`);
+    }
+    values.push(...b.keys, ...b.rowData);
+    return `(${rowPlaceholders.join(', ')})`;
+  });
+
+  const colNames = [...keys.map(c => `"${c}"`), ...tableColumns.map(c => `"${c}"`)];
+  const updateSet = tableColumns.map(c => `"${c}" = EXCLUDED."${c}"`);
+  const conflictCols = keys.map(c => `"${c}"`).join(', ');
+
+  const query = `
+    INSERT INTO "${tableName}" (${colNames.join(', ')})
+    VALUES ${placeholders.join(', ')}
+    ON CONFLICT (${conflictCols}) DO UPDATE SET ${updateSet.join(', ')}
+  `;
+  await client.query(query, values);
+}
+
+// ------------------ UNDUPLICATEDPATIENTS IMPORT ------------------
+async function importUnduplicatedPatients(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvMrns = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => c !== 'MRN');
+  dateColumn = allColumns.find(c => /date/i.test(c));
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const mrn = row['MRN'];
+      const action = (row['Action'] || '').toUpperCase();
+      const dateStr = dateColumn ? row[dateColumn] : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!mrn) {
+        skippedRows.push({ row, reason: 'Missing MRN' });
+        continue;
+      }
+
+      csvMrns.add(mrn);
+
+      if (action === 'DELETE') {
+        deleteIds.add(mrn);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
+      batch.push({ keys: [mrn], rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, ['MRN']);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, ['MRN']);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "MRN" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvMrns.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND "MRN" NOT IN (SELECT unnest($3::text[]))`,
+        [minDate, maxDate, Array.from(csvMrns)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ ACTIVE AGENCY IMPORT ------------------
+
+
+async function importActiveAgency(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvIds = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  // Ensure unique constraint for ON CONFLICT on "Admission ID"
+  await ensureActiveAgencyConstraint();
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+
+// Lookup data types to accurately detect date/time columns
+const typeRes = await client.query(`
+  SELECT column_name, data_type
+  FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = $1
+`, [tableName]);
+const colTypes = {};
+typeRes.rows.forEach(r => { colTypes[r.column_name] = r.data_type; });
+const isDateCol = {};
+Object.keys(colTypes).forEach(c => {
+  const t = (colTypes[c] || '').toLowerCase();
+  isDateCol[c] = t.includes('date') || t.includes('time');
+});
+
+  const keyColumn = 'Admission ID';
+  const tableColumns = allColumns.filter(c => c !== keyColumn);
+  dateColumn = allColumns.find(c => /date/i.test(c));
+
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    // Discover the actual header name once (handles "Admission ID", "admission_id", etc.)
+    let admissionHeader = null;
+
+    for await (const row of parser) {
+      if (!admissionHeader) {
+        admissionHeader =
+          Object.keys(row).find(
+            k => k && k.toLowerCase().replace(/[\s\-]+/g, '_') === 'admission_id'
+          ) || keyColumn;
+      }
+
+      processedRows++;
+      const admissionId = row[admissionHeader];
+      const action = (row['Action'] || '').toUpperCase();
+
+      const dateStr = dateColumn ? normalizeDateForPg(row[dateColumn]) : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!admissionId) {
+        skippedRows.push({ row, reason: 'Missing Admission ID' });
+        continue;
+      }
+
+      csvIds.add(admissionId);
+
+      if (action === 'DELETE') {
+        deleteIds.add(admissionId);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
+      batch.push({ keys: [admissionId], rowData });
+
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, [keyColumn]);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, [keyColumn]);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvIds.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND NOT ("${keyColumn}" = ANY($3))`,
+        [minDate, maxDate, Array.from(csvIds)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+
+
+
+// ------------------ PDGM IMPORT ------------------
+async function importPdgm(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvIds = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  // Ensure unique constraint for ON CONFLICT on "Admission ID"
+  await ensurePdgmConstraint();
+
+  // Discover columns in the table (excluding generated)
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+
+  // Lookup data types to identify date/time columns accurately
+  const typeRes = await client.query(`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const colTypes = {};
+  typeRes.rows.forEach(r => { colTypes[r.column_name] = r.data_type; });
+
+  const isDateCol = {};
+  Object.keys(colTypes).forEach(c => {
+    const t = (colTypes[c] || '').toLowerCase();
+    isDateCol[c] = t.includes('date') || t.includes('time');
+  });
+
+  // Prefer a business-relevant date column for windowing deletions
+  const preferredDateOrder = [
+    'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
+  ];
+  dateColumn = preferredDateOrder.find(c => allColumns.includes(c) && isDateCol[c]) ||
+               allColumns.find(c => /date/i.test(c)) || null;
+
+  const keyColumn = 'Admission ID';
+  const tableColumns = allColumns.filter(c => c != keyColumn);
+
+  await client.query('BEGIN');
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    // Robust header mapping for "Admission ID" variants
+    let admissionHeader = null;
+
+    for await (const row of parser) {
+      if (!admissionHeader) {
+        admissionHeader =
+          Object.keys(row).find(
+            k => k && k.toLowerCase().replace(/[\s\-]+/g, '_') === 'admission_id'
+          ) || keyColumn;
+      }
+
+      processedRows++;
+      const admissionId = row[admissionHeader];
+      const action = (row['Action'] || '').toUpperCase();
+
+      // Track min/max within the CSV date range for safe reconciliation
+      const dateStr = dateColumn ? normalizeDateForPg(row[dateColumn]) : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!admissionId) {
+        skippedRows.push({ row, reason: 'Missing Admission ID' });
+        continue;
+      }
+
+      csvIds.add(admissionId);
+
+      if (action === 'DELETE') {
+        deleteIds.add(admissionId);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
+      batch.push({ keys: [admissionId], rowData });
+
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, [keyColumn]);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, [keyColumn]);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvIds.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" 
+           WHERE "${dateColumn}" BETWEEN $1 AND $2
+             AND NOT ("${keyColumn}" = ANY($3))`,
+        [minDate, maxDate, Array.from(csvIds)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ BILLED AR AGING IMPORT ------------------
+async function importBilledArAging(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteKeys = new Set();
+  const csvKeys = new Set();
+  const keyColumns = ['Service Dates', 'Med Rec #', 'Invoice Num'];
+  let minDate = null, maxDate = null;
+
+  await ensureBilledArAgingConstraint();
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => !keyColumns.includes(c));
+  const dateColumn = allColumns.find(c => /bill\s*date/i.test(c)) || allColumns.find(c => /date/i.test(c));
+
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const keys = keyColumns.map(k => row[k]);
+      const action = (row['Action'] || '').toUpperCase();
+      const dateStr = dateColumn ? row[dateColumn] : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (keys.some(v => !v)) {
+        skippedRows.push({ row, reason: 'Missing key columns' });
+        continue;
+      }
+
+      const composite = keys.join('|');
+      csvKeys.add(composite);
+
+      if (action === 'DELETE') {
+        deleteKeys.add(composite);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => toNullIfEmpty(row[c]));
+      batch.push({ keys, rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, keyColumns);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, keyColumns);
+      insertedOrUpdated += batch.length;
+    }
+
+    const compositeExpr =
+      `COALESCE("Service Dates"::text,'') || '|' || COALESCE("Med Rec #"::text,'') || '|' || COALESCE("Invoice Num"::text,'')`;
+
+    if (deleteKeys.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE ${compositeExpr} = ANY($1)`,
+        [Array.from(deleteKeys)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvKeys.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND NOT (${compositeExpr} = ANY($3))`,
+        [minDate, maxDate, Array.from(csvKeys)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ QUEUE MANAGER IMPORT ------------------
+async function importQueueManager(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvIds = new Set();
+  let minDate = null, maxDate = null;
+
+  await ensureQueueManagerConstraint();
+
+  const result = await client.query(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+    `,
+    [tableName]
+  );
+
+  const allColumns = result.rows.map(r => r.column_name);
+  const keyColumn = 'QueueID';
+  const tableColumns = allColumns.filter(c => c !== keyColumn);
+  const dateColumn = allColumns.find(c => /date/i.test(c));
+
+  // Build a simple name-based date column map (no type lookup needed)
+  const isDateCol = {}; allColumns.forEach(c => { isDateCol[c] = /date/i.test(c); });
+
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+      const id = row[keyColumn];
+      const action = (row['Action'] || '').toUpperCase();
+
+      const dateStr = dateColumn ? (isDateCol[dateColumn] ? normalizeDateForPg(row[dateColumn]) : row[dateColumn]) : null;
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!id) {
+        skippedRows.push({ row, reason: 'Missing key column' });
+        continue;
+      }
+
+      csvIds.add(id);
+
+      if (action === 'DELETE') {
+        deleteIds.add(id);
+        continue;
+      }
+
+      const rowData = tableColumns.map(c => {
+        const v = row[c];
+        return isDateCol[c] ? normalizeDateForPg(v) : toNullIfEmpty(v);
+      });
+
+      batch.push({ keys: [id], rowData });
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, [keyColumn]);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, [keyColumn]);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvIds.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND NOT ("${keyColumn}" = ANY($3))`,
+        [minDate, maxDate, Array.from(csvIds)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ ROOT ------------------
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
