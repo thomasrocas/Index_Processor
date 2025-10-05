@@ -137,10 +137,10 @@ async function ensurePdgmConstraint() {
         FROM pg_indexes
         WHERE schemaname = 'public'
           AND tablename = 'pdgm'
-          AND indexname = 'pdgm_admission_id_uniq'
+          AND indexname = 'pdgm_mrn_uniq'
       ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX pdgm_admission_id_uniq
-                 ON public.pdgm("Admission ID")';
+        EXECUTE 'CREATE UNIQUE INDEX pdgm_mrn_uniq
+                 ON public.pdgm("MRN")';
       END IF;
     END$$;
   `);
@@ -746,12 +746,12 @@ async function importPdgm(filePath, tableName) {
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
-  const deleteIds = new Set();
-  const csvIds = new Set();
+  const deleteMrns = new Set();
+  const csvMrns = new Set();
   let minDate = null, maxDate = null;
   let dateColumn = null;
 
-  // Ensure unique constraint for ON CONFLICT on "Admission ID"
+  // Ensure unique constraint for ON CONFLICT on "MRN"
   await ensurePdgmConstraint();
 
   // Discover columns in the table (excluding generated)
@@ -788,7 +788,7 @@ async function importPdgm(filePath, tableName) {
   dateColumn = preferredDateOrder.find(c => allColumns.includes(c) && isDateCol[c]) ||
                allColumns.find(c => /date/i.test(c)) || null;
 
-  const keyColumn = 'Admission ID';
+  const keyColumn = 'MRN';
   const tableColumns = allColumns.filter(c => c != keyColumn);
 
   await client.query('BEGIN');
@@ -796,19 +796,23 @@ async function importPdgm(filePath, tableName) {
     let batch = [];
     const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
 
-    // Robust header mapping for "Admission ID" variants
-    let admissionHeader = null;
+    // Robust header mapping for "MRN" variants
+    let mrnHeader = null;
 
     for await (const row of parser) {
-      if (!admissionHeader) {
-        admissionHeader =
+      if (!mrnHeader) {
+        mrnHeader =
           Object.keys(row).find(
-            k => k && k.toLowerCase().replace(/[\s\-]+/g, '_') === 'admission_id'
+            k =>
+              k &&
+              k
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '') === 'mrn'
           ) || keyColumn;
       }
 
       processedRows++;
-      const admissionId = row[admissionHeader];
+      const mrn = row[mrnHeader];
       const action = (row['Action'] || '').toUpperCase();
 
       // Track min/max within the CSV date range for safe reconciliation
@@ -821,20 +825,20 @@ async function importPdgm(filePath, tableName) {
         }
       }
 
-      if (!admissionId) {
-        skippedRows.push({ row, reason: 'Missing Admission ID' });
+      if (!mrn) {
+        skippedRows.push({ row, reason: 'Missing MRN' });
         continue;
       }
 
-      csvIds.add(admissionId);
+      csvMrns.add(mrn);
 
       if (action === 'DELETE') {
-        deleteIds.add(admissionId);
+        deleteMrns.add(mrn);
         continue;
       }
 
       const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
-      batch.push({ keys: [admissionId], rowData });
+      batch.push({ keys: [mrn], rowData });
 
       if (batch.length >= BATCH_SIZE) {
         await processBatch(batch, tableName, tableColumns, [keyColumn]);
@@ -848,20 +852,20 @@ async function importPdgm(filePath, tableName) {
       insertedOrUpdated += batch.length;
     }
 
-    if (deleteIds.size) {
+    if (deleteMrns.size) {
       const deleteRes = await client.query(
         `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
-        [Array.from(deleteIds)]
+        [Array.from(deleteMrns)]
       );
       deletedCount += deleteRes.rowCount;
     }
 
-    if (dateColumn && minDate && maxDate && csvIds.size) {
+    if (dateColumn && minDate && maxDate && csvMrns.size) {
       const deleteExistingRes = await client.query(
-        `DELETE FROM "${tableName}" 
+        `DELETE FROM "${tableName}"
            WHERE "${dateColumn}" BETWEEN $1 AND $2
              AND NOT ("${keyColumn}" = ANY($3))`,
-        [minDate, maxDate, Array.from(csvIds)]
+        [minDate, maxDate, Array.from(csvMrns)]
       );
       deletedCount += deleteExistingRes.rowCount;
     }
