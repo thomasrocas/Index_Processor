@@ -640,9 +640,18 @@ const typeRes = await client.query(`
 const colTypes = {};
 typeRes.rows.forEach(r => { colTypes[r.column_name] = r.data_type; });
 const isDateCol = {};
+const numericColumnKinds = {};
 Object.keys(colTypes).forEach(c => {
   const t = (colTypes[c] || '').toLowerCase();
-  isDateCol[c] = t.includes('date') || t.includes('time');
+  const isDateLike = t.includes('date') || t.includes('time');
+  isDateCol[c] = isDateLike;
+  if (!isDateLike) {
+    if (/\b(?:int|bigint|smallint)\b/.test(t)) {
+      numericColumnKinds[c] = 'integer';
+    } else if (/\b(?:numeric|decimal|double|real|money|float)\b/.test(t)) {
+      numericColumnKinds[c] = 'decimal';
+    }
+  }
 });
 
   const keyColumn = 'Admission ID';
@@ -658,6 +667,46 @@ Object.keys(colTypes).forEach(c => {
     // Discover the actual header name once (handles "Admission ID", "admission_id", etc.)
     let admissionHeader = null;
 
+    function sanitizeColumnValue(columnName, rawValue) {
+      if (!columnName) return toNullIfEmpty(rawValue);
+
+      if (isDateCol[columnName]) {
+        return normalizeDateForPg(rawValue);
+      }
+
+      const numericKind = numericColumnKinds[columnName];
+      if (!numericKind) {
+        return toNullIfEmpty(rawValue);
+      }
+
+      if (rawValue === null || rawValue === undefined) return null;
+
+      let s = String(rawValue).trim();
+      if (s === '') return null;
+
+      let isNegative = false;
+      if (s.startsWith('(') && s.endsWith(')')) {
+        isNegative = true;
+        s = s.slice(1, -1);
+      }
+
+      s = s.replace(/[\$,]/g, '').replace(/\s+/g, '');
+      if (isNegative) s = '-' + s;
+
+      if (numericKind === 'integer') {
+        s = s.replace(/^\+/, '');
+        if (!/^[+-]?\d+$/.test(s)) return null;
+        return s;
+      }
+
+      s = s.replace(/^\+/, '');
+      if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(s)) return null;
+      if (s.startsWith('.')) s = '0' + s;
+      if (s.startsWith('-.')) s = '-0' + s.slice(1);
+      if (s.endsWith('.')) s = s + '0';
+      return s;
+    }
+
     for await (const row of parser) {
       if (!admissionHeader) {
         admissionHeader =
@@ -667,10 +716,10 @@ Object.keys(colTypes).forEach(c => {
       }
 
       processedRows++;
-      const admissionId = row[admissionHeader];
+      const admissionId = sanitizeColumnValue(keyColumn, row[admissionHeader]);
       const action = (row['Action'] || '').toUpperCase();
 
-      const dateStr = dateColumn ? normalizeDateForPg(row[dateColumn]) : null;
+      const dateStr = dateColumn ? sanitizeColumnValue(dateColumn, row[dateColumn]) : null;
       if (dateStr) {
         const d = new Date(dateStr);
         if (!isNaN(d)) {
@@ -679,8 +728,8 @@ Object.keys(colTypes).forEach(c => {
         }
       }
 
-      if (!admissionId) {
-        skippedRows.push({ row, reason: 'Missing Admission ID' });
+      if (admissionId === null) {
+        skippedRows.push({ row, reason: 'Admission ID missing or invalid after normalization' });
         continue;
       }
 
@@ -691,7 +740,7 @@ Object.keys(colTypes).forEach(c => {
         continue;
       }
 
-      const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
+      const rowData = tableColumns.map(c => sanitizeColumnValue(c, row[c]));
       batch.push({ keys: [admissionId], rowData });
 
       if (batch.length >= BATCH_SIZE) {
