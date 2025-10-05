@@ -54,7 +54,7 @@
         <!-- ✅ FIX: send correct table name for Unduplicated importer -->
         <option value="unduplicatedpatients">Unduplicated Census</option>
         <option value="active_agency">Active Agency Census</option>
-        <option value="queue_manager">PDGM</option>
+        <option value="pdgm">PDGM</option>
       </select>
 
       <label for="csvFile">Choose CSV File:</label>
@@ -62,7 +62,7 @@
 
       <button type="submit">Upload</button>
     </form>
-    <div class="muted">Tip: Main Table requires a "Visit ID". Unduplicated requires "MRN".</div>
+    <div class="muted">Tip: Main Table requires a "Visit ID". Unduplicated and PDGM require "MRN".</div>
     <div id="status"></div>
   </div>
 
