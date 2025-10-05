@@ -1,17 +1,19 @@
-const express = require('express');
-const { Client } = require('pg');
-const multer = require('multer');
+const isTestEnv = process.env.NODE_ENV === 'test';
+
+const express = isTestEnv ? null : require('express');
+const { Client } = isTestEnv ? { Client: class {} } : require('pg');
+const multer = isTestEnv ? null : require('multer');
 const fs = require('fs');
 const path = require('path');
-const { parse } = require('csv-parse');
-const { stringify } = require('csv-stringify');
-const copyFrom = require('pg-copy-streams').from;
+const { parse } = isTestEnv ? { parse: null } : require('csv-parse');
+const { stringify } = isTestEnv ? { stringify: null } : require('csv-stringify');
+const copyFrom = isTestEnv ? null : require('pg-copy-streams').from;
 const { Transform } = require('stream');
 
-const app = express();
+const app = isTestEnv ? createTestAppStub() : express();
 const PORT = 3000;
 
-const client = new Client({
+let client = new Client({
   user: 'postgres',
   host: 'localhost',
   database: 'clinicalvisits',
@@ -19,19 +21,50 @@ const client = new Client({
   port: 5432,
 });
 
-client.connect()
-  .then(() => console.log('✅ Connected to PostgreSQL!'))
-  .catch(err => console.error('❌ PostgreSQL connection error', err));
+if (process.env.NODE_ENV !== 'test') {
+  client.connect()
+    .then(() => console.log('✅ Connected to PostgreSQL!'))
+    .catch(err => console.error('❌ PostgreSQL connection error', err));
+}
 
-const upload = multer({ dest: 'uploads/' });
-app.use(express.static('public'));
-app.use(express.urlencoded({ extended: true }));
+const upload = isTestEnv ? createTestUploadStub() : multer({ dest: 'uploads/' });
+if (!isTestEnv) {
+  app.use(express.static('public'));
+  app.use(express.urlencoded({ extended: true }));
+}
+
+function setClientForTesting(testClient) {
+  client = testClient;
+}
+
+function createTestAppStub() {
+  return {
+    use: () => {},
+    post: () => {},
+    get: () => {},
+  };
+}
+
+function createTestUploadStub() {
+  return {
+    single: () => (req, _res, next) => {
+      if (typeof next === 'function') next();
+    },
+  };
+}
 
 // ------------------ Helpers ------------------
 function toNullIfEmpty(v) {
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
   return s === '' ? null : s;
+}
+
+function normalizeIdentifier(name) {
+  return (name ?? '')
+    .toString()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
 }
 
 const CSV_OPTS_TOLERANT = {
@@ -129,21 +162,33 @@ async function ensureActiveAgencyConstraint() {
 
 
 async function ensurePdgmConstraint() {
-  await client.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (
-        SELECT 1
-        FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND tablename = 'pdgm'
-          AND indexname = 'pdgm_admission_id_uniq'
-      ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX pdgm_admission_id_uniq
-                 ON public.pdgm("Admission ID")';
-      END IF;
-    END$$;
+  const colRes = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'pdgm'
   `);
+
+  const columnNames = colRes.rows.map(r => r.column_name);
+  const lookup = new Map();
+  columnNames.forEach(name => {
+    lookup.set(normalizeIdentifier(name), name);
+  });
+
+  const mrnColumn = lookup.get('mrn');
+  const periodColumn =
+    lookup.get('periodstart') || lookup.get('periodstartdate');
+
+  if (!mrnColumn || !periodColumn) {
+    throw new Error('PDGM table must contain MRN and Period Start columns');
+  }
+
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS pdgm_mrn_period_start_uniq
+    ON public.pdgm("${mrnColumn}", "${periodColumn}")
+  `);
+
+  return { keyColumns: [mrnColumn, periodColumn] };
 }
 
 
@@ -795,15 +840,14 @@ async function importPdgm(filePath, tableName) {
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
-  const deleteIds = new Set();
-  const csvIds = new Set();
+  const deleteKeys = new Set();
+  const csvKeys = new Set();
   let minDate = null, maxDate = null;
   let dateColumn = null;
 
-  // Ensure unique constraint for ON CONFLICT on "Admission ID"
-  await ensurePdgmConstraint();
+  const { keyColumns } = await ensurePdgmConstraint();
+  const keyColumnSet = new Set(keyColumns);
 
-  // Discover columns in the table (excluding generated)
   const result = await client.query(`
     SELECT column_name
     FROM information_schema.columns
@@ -812,8 +856,8 @@ async function importPdgm(filePath, tableName) {
   `, [tableName]);
 
   const allColumns = result.rows.map(r => r.column_name);
+  const tableColumns = allColumns.filter(c => !keyColumnSet.has(c));
 
-  // Lookup data types to identify date/time columns accurately
   const typeRes = await client.query(`
     SELECT column_name, data_type
     FROM information_schema.columns
@@ -830,87 +874,122 @@ async function importPdgm(filePath, tableName) {
     isDateCol[c] = t.includes('date') || t.includes('time');
   });
 
-  // Prefer a business-relevant date column for windowing deletions
+  const periodKeyColumn = keyColumns.find(c => /period/.test(normalizeIdentifier(c)));
   const preferredDateOrder = [
-    'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
-  ];
+    periodKeyColumn,
+    'Period Start',
+    'Period Start Date',
+    'Admitted Date',
+    'SOC',
+    'Discharge Date',
+    'DOB'
+  ].filter(Boolean);
   dateColumn = preferredDateOrder.find(c => allColumns.includes(c) && isDateCol[c]) ||
                allColumns.find(c => /date/i.test(c)) || null;
 
-  const keyColumn = 'Admission ID';
-  const tableColumns = allColumns.filter(c => c != keyColumn);
+  const compositeExpr = keyColumns
+    .map(c => `COALESCE("${c}"::text,'')`)
+    .join(` || '|' || `);
 
   await client.query('BEGIN');
+
   try {
     let batch = [];
     const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+    let headerMap = null;
 
-    // Robust header mapping for "Admission ID" variants
-    let admissionHeader = null;
+    const headerFallbacks = new Map([
+      ['periodstart', ['periodstartdate']],
+      ['periodstartdate', ['periodstart']],
+    ]);
+
+    const resolveHeader = columnName => {
+      const normalized = normalizeIdentifier(columnName);
+      if (headerMap?.has(normalized)) return headerMap.get(normalized);
+      const fallbacks = headerFallbacks.get(normalized);
+      if (fallbacks) {
+        for (const alt of fallbacks) {
+          if (headerMap?.has(alt)) return headerMap.get(alt);
+        }
+      }
+      return columnName;
+    };
 
     for await (const row of parser) {
-      if (!admissionHeader) {
-        admissionHeader =
-          Object.keys(row).find(
-            k => k && k.toLowerCase().replace(/[\s\-]+/g, '_') === 'admission_id'
-          ) || keyColumn;
+      if (!headerMap) {
+        headerMap = new Map();
+        Object.keys(row).forEach(k => {
+          headerMap.set(normalizeIdentifier(k), k);
+        });
       }
 
       processedRows++;
-      const admissionId = row[admissionHeader];
-      const action = (row['Action'] || '').toUpperCase();
 
-      // Track min/max within the CSV date range for safe reconciliation
-      const dateStr = dateColumn ? normalizeDateForPg(row[dateColumn]) : null;
-      if (dateStr) {
-        const d = new Date(dateStr);
-        if (!isNaN(d)) {
-          if (!minDate || d < minDate) minDate = d;
-          if (!maxDate || d > maxDate) maxDate = d;
+      const actionRaw = row[resolveHeader('Action')];
+      const action = (actionRaw || '').toUpperCase();
+
+      let dateStr = null;
+      if (dateColumn) {
+        const rawDate = row[resolveHeader(dateColumn)];
+        dateStr = isDateCol[dateColumn] ? normalizeDateForPg(rawDate) : rawDate;
+        if (dateStr) {
+          const d = new Date(dateStr);
+          if (!isNaN(d)) {
+            if (!minDate || d < minDate) minDate = d;
+            if (!maxDate || d > maxDate) maxDate = d;
+          }
         }
       }
 
-      if (!admissionId) {
-        skippedRows.push({ row, reason: 'Missing Admission ID' });
+      const keyValues = keyColumns.map(col => {
+        const raw = row[resolveHeader(col)];
+        return isDateCol[col] ? normalizeDateForPg(raw) : toNullIfEmpty(raw);
+      });
+
+      if (keyValues.some(v => v === null || v === undefined || v === '')) {
+        skippedRows.push({ row, reason: 'Missing key columns' });
         continue;
       }
 
-      csvIds.add(admissionId);
+      const compositeKey = keyValues.map(v => (v ?? '')).join('|');
+      csvKeys.add(compositeKey);
 
       if (action === 'DELETE') {
-        deleteIds.add(admissionId);
+        deleteKeys.add(compositeKey);
         continue;
       }
 
-      const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
-      batch.push({ keys: [admissionId], rowData });
+      const rowData = tableColumns.map(col => {
+        const raw = row[resolveHeader(col)];
+        return isDateCol[col] ? normalizeDateForPg(raw) : toNullIfEmpty(raw);
+      });
+
+      batch.push({ keys: keyValues, rowData });
 
       if (batch.length >= BATCH_SIZE) {
-        await processBatch(batch, tableName, tableColumns, [keyColumn]);
+        await processBatch(batch, tableName, tableColumns, keyColumns);
         insertedOrUpdated += batch.length;
         batch = [];
       }
     }
 
     if (batch.length) {
-      await processBatch(batch, tableName, tableColumns, [keyColumn]);
+      await processBatch(batch, tableName, tableColumns, keyColumns);
       insertedOrUpdated += batch.length;
     }
 
-    if (deleteIds.size) {
+    if (deleteKeys.size) {
       const deleteRes = await client.query(
-        `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
-        [Array.from(deleteIds)]
+        `DELETE FROM "${tableName}" WHERE ${compositeExpr} = ANY($1)`,
+        [Array.from(deleteKeys)]
       );
       deletedCount += deleteRes.rowCount;
     }
 
-    if (dateColumn && minDate && maxDate && csvIds.size) {
+    if (dateColumn && minDate && maxDate && csvKeys.size) {
       const deleteExistingRes = await client.query(
-        `DELETE FROM "${tableName}" 
-           WHERE "${dateColumn}" BETWEEN $1 AND $2
-             AND NOT ("${keyColumn}" = ANY($3))`,
-        [minDate, maxDate, Array.from(csvIds)]
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND NOT (${compositeExpr} = ANY($3))`,
+        [minDate, maxDate, Array.from(csvKeys)]
       );
       deletedCount += deleteExistingRes.rowCount;
     }
@@ -1151,4 +1230,12 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
+if (process.env.NODE_ENV === 'test') {
+  module.exports = {
+    processBatch,
+    setClientForTesting,
+    normalizeDateForPg,
+  };
+} else {
+  app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
+}
