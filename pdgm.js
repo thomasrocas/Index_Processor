@@ -1,17 +1,41 @@
-const express = require('express');
-const { Client } = require('pg');
-const multer = require('multer');
+const expressModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/express-stub')
+    : require('express');
+const express = expressModule;
+const pgModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/pg-stub')
+    : require('pg');
+const { Client } = pgModule;
+const multerModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/multer-stub')
+    : require('multer');
+const multer = multerModule;
 const fs = require('fs');
 const path = require('path');
-const { parse } = require('csv-parse');
-const { stringify } = require('csv-stringify');
-const copyFrom = require('pg-copy-streams').from;
+const csvParseModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/csv-parse-stub')
+    : require('csv-parse');
+const csvStringifyModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/csv-stringify-stub')
+    : require('csv-stringify');
+const pgCopyStreamsModule =
+  process.env.NODE_ENV === 'test'
+    ? require('./tests/pg-copy-streams-stub')
+    : require('pg-copy-streams');
+const { parse } = csvParseModule;
+const { stringify } = csvStringifyModule;
+const copyFrom = pgCopyStreamsModule.from;
 const { Transform } = require('stream');
 
 const app = express();
 const PORT = 3000;
 
-const client = new Client({
+let client = new Client({
   user: 'postgres',
   host: 'localhost',
   database: 'clinicalvisits',
@@ -19,9 +43,11 @@ const client = new Client({
   port: 5432,
 });
 
-client.connect()
-  .then(() => console.log('✅ Connected to PostgreSQL!'))
-  .catch(err => console.error('❌ PostgreSQL connection error', err));
+if (process.env.NODE_ENV !== 'test') {
+  client.connect()
+    .then(() => console.log('✅ Connected to PostgreSQL!'))
+    .catch(err => console.error('❌ PostgreSQL connection error', err));
+}
 
 const upload = multer({ dest: 'uploads/' });
 app.use(express.static('public'));
@@ -66,6 +92,10 @@ function normalizeDateForPg(v) {
     return `${yyyy}-${mm}-${dd}`;
   }
   return null;
+}
+
+function setClientForTesting(newClient) {
+  client = newClient;
 }
 
 async function ensureBilledArAgingConstraint() {
@@ -132,15 +162,25 @@ async function ensurePdgmConstraint() {
   await client.query(`
     DO $$
     BEGIN
-      IF NOT EXISTS (
+      IF EXISTS (
         SELECT 1
         FROM pg_indexes
         WHERE schemaname = 'public'
           AND tablename = 'pdgm'
           AND indexname = 'pdgm_mrn_uniq'
       ) THEN
-        EXECUTE 'CREATE UNIQUE INDEX pdgm_mrn_uniq
-                 ON public.pdgm("MRN")';
+        EXECUTE 'DROP INDEX IF EXISTS public.pdgm_mrn_uniq';
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'pdgm'
+          AND indexname = 'pdgm_mrn_period_start_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX pdgm_mrn_period_start_uniq
+                 ON public.pdgm("MRN", "Period Start Date")';
       END IF;
     END$$;
   `);
@@ -746,12 +786,12 @@ async function importPdgm(filePath, tableName) {
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
-  const deleteMrns = new Set();
-  const csvMrns = new Set();
+  const deleteCompositeKeys = new Set();
+  const csvCompositeKeys = new Set();
   let minDate = null, maxDate = null;
   let dateColumn = null;
 
-  // Ensure unique constraint for ON CONFLICT on "MRN"
+  // Ensure unique constraint for ON CONFLICT on composite key
   await ensurePdgmConstraint();
 
   // Discover columns in the table (excluding generated)
@@ -783,40 +823,64 @@ async function importPdgm(filePath, tableName) {
 
   // Prefer a business-relevant date column for windowing deletions
   const preferredDateOrder = [
-    'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
+    'Period Start Date', 'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
   ];
   dateColumn = preferredDateOrder.find(c => allColumns.includes(c) && isDateCol[c]) ||
                allColumns.find(c => /date/i.test(c)) || null;
 
-  const keyColumn = 'MRN';
-  const tableColumns = allColumns.filter(c => c != keyColumn);
+  const keyColumns = ['MRN', 'Period Start Date'];
+  const tableColumns = allColumns.filter(c => !keyColumns.includes(c));
 
   await client.query('BEGIN');
   try {
     let batch = [];
     const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
 
-    // Robust header mapping for "MRN" variants
+    // Robust header mapping for composite keys
     let mrnHeader = null;
+    let periodHeader = null;
+    const sanitizeHeaderName = header =>
+      (header || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    const periodHeaderTargets = new Set([
+      'periodstartdate',
+      'periodstartdt',
+      'periodstart'
+    ]);
 
     for await (const row of parser) {
-      if (!mrnHeader) {
-        mrnHeader =
-          Object.keys(row).find(
-            k =>
-              k &&
-              k
-                .toLowerCase()
-                .replace(/[^a-z0-9]+/g, '') === 'mrn'
-          ) || keyColumn;
+      if (!mrnHeader || !periodHeader) {
+        const headers = Object.keys(row);
+        if (!mrnHeader) {
+          mrnHeader =
+            headers.find(k => sanitizeHeaderName(k) === 'mrn') ||
+            keyColumns[0];
+        }
+        if (!periodHeader) {
+          periodHeader =
+            headers.find(k => periodHeaderTargets.has(sanitizeHeaderName(k))) ||
+            keyColumns[1];
+        }
       }
 
       processedRows++;
-      const mrn = row[mrnHeader];
+      const rawMrn = row[mrnHeader];
+      const normalizedMrn = toNullIfEmpty(rawMrn);
       const action = (row['Action'] || '').toUpperCase();
 
+      const periodSourceHeader = periodHeader || keyColumns[1];
+      const rawPeriodStart = row[periodSourceHeader];
+      const normalizedPeriodStart = normalizeDateForPg(rawPeriodStart);
+
       // Track min/max within the CSV date range for safe reconciliation
-      const dateStr = dateColumn ? normalizeDateForPg(row[dateColumn]) : null;
+      let dateStr = null;
+      if (dateColumn) {
+        const csvHeaderForDate =
+          dateColumn === keyColumns[1] && periodHeader ? periodHeader : dateColumn;
+        const rawDateValue = row[csvHeaderForDate];
+        dateStr = isDateCol[dateColumn]
+          ? normalizeDateForPg(rawDateValue)
+          : toNullIfEmpty(rawDateValue);
+      }
       if (dateStr) {
         const d = new Date(dateStr);
         if (!isNaN(d)) {
@@ -825,47 +889,54 @@ async function importPdgm(filePath, tableName) {
         }
       }
 
-      if (!mrn) {
-        skippedRows.push({ row, reason: 'Missing MRN' });
+      if (!normalizedMrn || !normalizedPeriodStart) {
+        skippedRows.push({ row, reason: 'Missing MRN or Period Start Date' });
         continue;
       }
 
-      csvMrns.add(mrn);
+      const compositeKey = `${normalizedMrn}|${normalizedPeriodStart}`;
+      csvCompositeKeys.add(compositeKey);
 
       if (action === 'DELETE') {
-        deleteMrns.add(mrn);
+        deleteCompositeKeys.add(compositeKey);
         continue;
       }
 
-      const rowData = tableColumns.map(c => isDateCol[c] ? normalizeDateForPg(row[c]) : toNullIfEmpty(row[c]));
-      batch.push({ keys: [mrn], rowData });
+      const rowData = tableColumns.map(c => {
+        const value = row[c];
+        return isDateCol[c] ? normalizeDateForPg(value) : toNullIfEmpty(value);
+      });
+      batch.push({ keys: [normalizedMrn, normalizedPeriodStart], rowData });
 
       if (batch.length >= BATCH_SIZE) {
-        await processBatch(batch, tableName, tableColumns, [keyColumn]);
+        await processBatch(batch, tableName, tableColumns, keyColumns);
         insertedOrUpdated += batch.length;
         batch = [];
       }
     }
 
     if (batch.length) {
-      await processBatch(batch, tableName, tableColumns, [keyColumn]);
+      await processBatch(batch, tableName, tableColumns, keyColumns);
       insertedOrUpdated += batch.length;
     }
 
-    if (deleteMrns.size) {
+    const compositeExpr =
+      `COALESCE("MRN"::text,'') || '|' || COALESCE("Period Start Date"::text,'')`;
+
+    if (deleteCompositeKeys.size) {
       const deleteRes = await client.query(
-        `DELETE FROM "${tableName}" WHERE "${keyColumn}" = ANY($1)`,
-        [Array.from(deleteMrns)]
+        `DELETE FROM "${tableName}" WHERE ${compositeExpr} = ANY($1)`,
+        [Array.from(deleteCompositeKeys)]
       );
       deletedCount += deleteRes.rowCount;
     }
 
-    if (dateColumn && minDate && maxDate && csvMrns.size) {
+    if (dateColumn && minDate && maxDate && csvCompositeKeys.size) {
       const deleteExistingRes = await client.query(
         `DELETE FROM "${tableName}"
            WHERE "${dateColumn}" BETWEEN $1 AND $2
-             AND NOT ("${keyColumn}" = ANY($3))`,
-        [minDate, maxDate, Array.from(csvMrns)]
+             AND NOT (${compositeExpr} = ANY($3))`,
+        [minDate, maxDate, Array.from(csvCompositeKeys)]
       );
       deletedCount += deleteExistingRes.rowCount;
     }
@@ -1106,4 +1177,14 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
+}
+
+module.exports = {
+  ensurePdgmConstraint,
+  importPdgm,
+  processBatch,
+  setClientForTesting,
+  normalizeDateForPg,
+};
