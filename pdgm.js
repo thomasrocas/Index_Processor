@@ -180,7 +180,7 @@ async function ensurePdgmConstraint() {
           AND indexname = 'pdgm_mrn_period_start_uniq'
       ) THEN
         EXECUTE 'CREATE UNIQUE INDEX pdgm_mrn_period_start_uniq
-                 ON public.pdgm("MRN", "Period Start Date")';
+                 ON public.pdgm("MRN", "Period Start")';
       END IF;
     END$$;
   `);
@@ -823,12 +823,12 @@ async function importPdgm(filePath, tableName) {
 
   // Prefer a business-relevant date column for windowing deletions
   const preferredDateOrder = [
-    'Period Start Date', 'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
+    'Period Start', 'Admitted Date', 'SOC', 'Discharge Date', 'DOB'
   ];
   dateColumn = preferredDateOrder.find(c => allColumns.includes(c) && isDateCol[c]) ||
                allColumns.find(c => /date/i.test(c)) || null;
 
-  const keyColumns = ['MRN', 'Period Start Date'];
+  const keyColumns = ['MRN', 'Period Start'];
   const tableColumns = allColumns.filter(c => !keyColumns.includes(c));
 
   await client.query('BEGIN');
@@ -890,7 +890,7 @@ async function importPdgm(filePath, tableName) {
       }
 
       if (!normalizedMrn || !normalizedPeriodStart) {
-        skippedRows.push({ row, reason: 'Missing MRN or Period Start Date' });
+        skippedRows.push({ row, reason: 'Missing MRN or Period Start' });
         continue;
       }
 
@@ -921,7 +921,7 @@ async function importPdgm(filePath, tableName) {
     }
 
     const compositeExpr =
-      `COALESCE("MRN"::text,'') || '|' || COALESCE("Period Start Date"::text,'')`;
+      `COALESCE("MRN"::text,'') || '|' || COALESCE("Period Start"::text,'')`;
 
     if (deleteCompositeKeys.size) {
       const deleteRes = await client.query(
