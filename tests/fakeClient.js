@@ -2,20 +2,48 @@ class FakeClient {
   constructor(options = {}) {
     if (typeof options === 'string') {
       this.tableName = options;
+      options = {};
     } else {
       this.tableName = options.tableName || 'pdgm';
     }
+
     this.storage = new Map();
     this.lastConflictColumns = [];
+    this.columns = options.columns || Object.keys(options.columnTypes || {});
+    this.columnTypes = options.columnTypes || {};
   }
 
   async query(sql, params = []) {
+    const normalizedSql = sql.trim();
     const tableName = this.tableName.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const insertRegex = new RegExp(`^\\s*INSERT\\s+INTO\\s+"${tableName}"`, 'i');
-    const deleteRegex = new RegExp(`^\\s*DELETE\\s+FROM\\s+"${tableName}"`, 'i');
+    const insertRegex = new RegExp(`^INSERT\\s+INTO\\s+"${tableName}"`, 'i');
+    const deleteRegex = new RegExp(`^DELETE\\s+FROM\\s+"${tableName}"`, 'i');
 
-    if (insertRegex.test(sql)) {
-      const insertMatch = sql.match(new RegExp(`INSERT\\s+INTO\\s+"${tableName}"\\s*\\(([^)]+)\\)`, 'i'));
+    if (/^(BEGIN|COMMIT|ROLLBACK)\b/i.test(normalizedSql)) {
+      return { rowCount: 0 };
+    }
+
+    if (/FROM\s+information_schema\.columns/i.test(normalizedSql)) {
+      if (/is_generated\s*=\s*'NEVER'/i.test(normalizedSql)) {
+        return {
+          rows: this.columns.map(column_name => ({ column_name })),
+        };
+      }
+
+      if (/data_type/i.test(normalizedSql)) {
+        return {
+          rows: Object.entries(this.columnTypes).map(([column_name, data_type]) => ({
+            column_name,
+            data_type,
+          })),
+        };
+      }
+    }
+
+    if (insertRegex.test(normalizedSql)) {
+      const insertMatch = normalizedSql.match(
+        new RegExp(`INSERT\\s+INTO\\s+"${tableName}"\\s*\\(([^)]+)\\)`, 'i')
+      );
       if (!insertMatch) {
         throw new Error('Unable to parse INSERT statement for columns.');
       }
@@ -23,7 +51,7 @@ class FakeClient {
         .split(',')
         .map(part => part.trim().replace(/"/g, ''));
 
-      const conflictMatch = sql.match(/ON\s+CONFLICT\s*\(([^)]+)\)/i);
+      const conflictMatch = normalizedSql.match(/ON\s+CONFLICT\s*\(([^)]+)\)/i);
       if (!conflictMatch) {
         throw new Error('Unable to parse conflict columns.');
       }
@@ -53,14 +81,19 @@ class FakeClient {
       return { rowCount };
     }
 
-    if (deleteRegex.test(sql)) {
-      const whereMatch = sql.match(/WHERE\s+"([^"\s]+)"\s*=\s*ANY\(\$1\)/i);
+    if (deleteRegex.test(normalizedSql)) {
+      if (/BETWEEN\s+\$1\s+AND\s+\$2/i.test(normalizedSql)) {
+        return { rowCount: 0 };
+      }
+
+      const whereMatch = normalizedSql.match(/WHERE\s+"([^"]+)"\s*=\s*ANY\(\$(\d+)\)/i);
       if (!whereMatch) {
-        throw new Error('Unable to parse DELETE statement for key column.');
+        return { rowCount: 0 };
       }
 
       const keyColumn = whereMatch[1];
-      const ids = Array.isArray(params[0]) ? params[0] : [];
+      const paramIndex = parseInt(whereMatch[2], 10) - 1;
+      const ids = Array.isArray(params[paramIndex]) ? params[paramIndex] : [];
       const idSet = new Set(ids.map(v => (v === null || v === undefined ? v : String(v))));
       let deleted = 0;
 
