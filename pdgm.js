@@ -344,7 +344,7 @@ if (tableName === 'casemanager') {
   await appendImportLog(actor, summary, "importQueueManager");
   // Ensure RFNP reflects any QM changes from this batch
   await client.query('SELECT public.refresh_all_rollups()');
-  
+
   return res.send(`
     ✅ Queue Manager Done!
     Processed Rows: ${summary.processedRows}
@@ -352,8 +352,19 @@ if (tableName === 'casemanager') {
     Deleted Rows: ${summary.deletedCount}
     Skipped Rows: ${summary.skippedRows}
   `);
-}
- else {
+} else if (tableName === 'referrals') {
+  const summary = await importReferrals(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importReferrals");
+
+  return res.send(`
+    ✅ Referrals Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+} else {
       fs.unlinkSync(filePath);
       return res.status(400).send('❌ Unknown table selected.');
     }
