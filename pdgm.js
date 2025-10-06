@@ -5,8 +5,8 @@ const { Client } = isTestEnv ? { Client: class {} } : require('pg');
 const multer = isTestEnv ? null : require('multer');
 const fs = require('fs');
 const path = require('path');
-const { parse } = isTestEnv ? { parse: null } : require('csv-parse');
-const { stringify } = isTestEnv ? { stringify: null } : require('csv-stringify');
+const { parse } = isTestEnv ? require('./tests/csv-parse-stub') : require('csv-parse');
+const { stringify } = isTestEnv ? require('./tests/csv-stringify-stub') : require('csv-stringify');
 const copyFrom = isTestEnv ? null : require('pg-copy-streams').from;
 const { Transform } = require('stream');
 
@@ -155,6 +155,25 @@ async function ensureActiveAgencyConstraint() {
       ) THEN
         EXECUTE 'CREATE UNIQUE INDEX active_agency_admission_id_uniq
                  ON public.active_agency("Admission ID")';
+      END IF;
+    END$$;
+  `);
+}
+
+
+async function ensureRawDataConstraint() {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'raw_data'
+          AND indexname = 'raw_data_admission_id_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX raw_data_admission_id_uniq
+                 ON public.raw_data("Admission ID")';
       END IF;
     END$$;
   `);
@@ -316,18 +335,30 @@ if (tableName === 'casemanager') {
   `);
 
   } else if (tableName === 'active_agency') {
-  const summary = await importActiveAgency(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importActiveAgency");
+    const summary = await importActiveAgency(filePath, tableName);
+    const actor = resolveActor(req);
+    await appendImportLog(actor, summary, "importActiveAgency");
 
-  return res.send(`
-    ✅ Import ActiveAgency Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
+    return res.send(`
+      ✅ Import ActiveAgency Done!
+      Processed Rows: ${summary.processedRows}
+      Inserted/Updated: ${summary.insertedOrUpdated}
+      Deleted Rows: ${summary.deletedCount}
+      Skipped Rows: ${summary.skippedRows}
+    `);
 
+  } else if (tableName === 'raw_data') {
+    const summary = await importRawData(filePath, tableName);
+    const actor = resolveActor(req);
+    await appendImportLog(actor, summary, "importRawData");
+
+    return res.send(`
+      ✅ Import RawData Done!
+      Processed Rows: ${summary.processedRows}
+      Inserted/Updated: ${summary.insertedOrUpdated}
+      Deleted Rows: ${summary.deletedCount}
+      Skipped Rows: ${summary.skippedRows}
+    `);
 
   } else if (tableName === 'pdgm') {
   const summary = await importPdgm(filePath, tableName);
@@ -810,20 +841,22 @@ async function importReferrals(filePath, tableName) {
   }
 }
 
-// ------------------ ACTIVE AGENCY IMPORT ------------------
+// ------------------ ADMISSION-ID IMPORT HELPERS ------------------
 
-
-async function importActiveAgency(filePath, tableName) {
+async function importAdmissionIdTable({ filePath, tableName, ensureConstraint }) {
   const BATCH_SIZE = 500;
-  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  let processedRows = 0;
+  let insertedOrUpdated = 0;
+  let deletedCount = 0;
   const skippedRows = [];
   const deleteIds = new Set();
   const csvIds = new Set();
-  let minDate = null, maxDate = null;
-  let dateColumn = null;
+  let minDate = null;
+  let maxDate = null;
 
-  // Ensure unique constraint for ON CONFLICT on "Admission ID"
-  await ensureActiveAgencyConstraint();
+  if (ensureConstraint) {
+    await ensureConstraint();
+  }
 
   const result = await client.query(`
     SELECT column_name
@@ -834,32 +867,35 @@ async function importActiveAgency(filePath, tableName) {
 
   const allColumns = result.rows.map(r => r.column_name);
 
-// Lookup data types to accurately detect date/time columns
-const typeRes = await client.query(`
-  SELECT column_name, data_type
-  FROM information_schema.columns
-  WHERE table_schema = 'public' AND table_name = $1
-`, [tableName]);
-const colTypes = {};
-typeRes.rows.forEach(r => { colTypes[r.column_name] = r.data_type; });
-const isDateCol = {};
-const numericColumnKinds = {};
-Object.keys(colTypes).forEach(c => {
-  const t = (colTypes[c] || '').toLowerCase();
-  const isDateLike = t.includes('date') || t.includes('time');
-  isDateCol[c] = isDateLike;
-  if (!isDateLike) {
-    if (/\b(?:int|bigint|smallint)\b/.test(t)) {
-      numericColumnKinds[c] = 'integer';
-    } else if (/\b(?:numeric|decimal|double|real|money|float)\b/.test(t)) {
-      numericColumnKinds[c] = 'decimal';
+  const typeRes = await client.query(`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
+  `, [tableName]);
+
+  const colTypes = {};
+  typeRes.rows.forEach(r => {
+    colTypes[r.column_name] = r.data_type;
+  });
+
+  const isDateCol = {};
+  const numericColumnKinds = {};
+  Object.keys(colTypes).forEach(c => {
+    const t = (colTypes[c] || '').toLowerCase();
+    const isDateLike = t.includes('date') || t.includes('time');
+    isDateCol[c] = isDateLike;
+    if (!isDateLike) {
+      if (/\b(?:int|bigint|smallint)\b/.test(t)) {
+        numericColumnKinds[c] = 'integer';
+      } else if (/\b(?:numeric|decimal|double|real|money|float)\b/.test(t)) {
+        numericColumnKinds[c] = 'decimal';
+      }
     }
-  }
-});
+  });
 
   const keyColumn = 'Admission ID';
   const tableColumns = allColumns.filter(c => c !== keyColumn);
-  dateColumn = allColumns.find(c => /date/i.test(c));
+  const dateColumn = allColumns.find(c => /date/i.test(c));
 
   await client.query('BEGIN');
 
@@ -867,7 +903,6 @@ Object.keys(colTypes).forEach(c => {
     let batch = [];
     const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
 
-    // Discover the actual header name once (handles "Admission ID", "admission_id", etc.)
     let admissionHeader = null;
 
     function sanitizeColumnValue(columnName, rawValue) {
@@ -919,7 +954,9 @@ Object.keys(colTypes).forEach(c => {
       }
 
       processedRows++;
-      const admissionId = sanitizeColumnValue(keyColumn, row[admissionHeader]);
+
+      const rawAdmissionId = admissionHeader ? row[admissionHeader] : row[keyColumn];
+      const admissionId = sanitizeColumnValue(keyColumn, rawAdmissionId);
       const action = (row['Action'] || '').toUpperCase();
 
       const dateStr = dateColumn ? sanitizeColumnValue(dateColumn, row[dateColumn]) : null;
@@ -932,7 +969,10 @@ Object.keys(colTypes).forEach(c => {
       }
 
       if (admissionId === null) {
-        skippedRows.push({ row, reason: 'Admission ID missing or invalid after normalization' });
+        skippedRows.push({
+          row,
+          reason: 'Admission ID missing or invalid after normalization',
+        });
         continue;
       }
 
@@ -990,8 +1030,21 @@ Object.keys(colTypes).forEach(c => {
   }
 }
 
+async function importActiveAgency(filePath, tableName) {
+  return importAdmissionIdTable({
+    filePath,
+    tableName,
+    ensureConstraint: ensureActiveAgencyConstraint,
+  });
+}
 
-
+async function importRawData(filePath, tableName) {
+  return importAdmissionIdTable({
+    filePath,
+    tableName,
+    ensureConstraint: ensureRawDataConstraint,
+  });
+}
 
 // ------------------ PDGM IMPORT ------------------
 async function importPdgm(filePath, tableName) {
@@ -1393,6 +1446,11 @@ if (process.env.NODE_ENV === 'test') {
     processBatch,
     setClientForTesting,
     normalizeDateForPg,
+    importAdmissionIdTable,
+    importActiveAgency,
+    importRawData,
+    ensureActiveAgencyConstraint,
+    ensureRawDataConstraint,
   };
 } else {
   app.listen(PORT, () => console.log(`🚀 Unified server running at http://localhost:${PORT}`));
