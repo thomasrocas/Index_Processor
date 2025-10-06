@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "type": "commonjs",
   "scripts": {
-    "test": "NODE_ENV=test node tests/pdgm_import.test.js"
+    "test": "NODE_ENV=test node tests/pdgm_import.test.js && NODE_ENV=test node tests/referrals_import.test.js"
   },
   "dependencies": {
     "pg": "^8.11.3"

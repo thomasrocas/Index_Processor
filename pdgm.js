@@ -161,6 +161,25 @@ async function ensureActiveAgencyConstraint() {
 }
 
 
+async function ensureReferralsConstraint() {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'referrals'
+          AND indexname = 'referrals_mrn_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX referrals_mrn_uniq
+                 ON public.referrals("MRN")';
+      END IF;
+    END$$;
+  `);
+}
+
+
 async function ensurePdgmConstraint() {
   const colRes = await client.query(`
     SELECT column_name
@@ -649,6 +668,134 @@ async function importUnduplicatedPatients(filePath, tableName) {
 
     await client.query('COMMIT');
     fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+async function importReferrals(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteIds = new Set();
+  const csvMrns = new Set();
+  let minDate = null, maxDate = null;
+  let dateColumn = null;
+
+  await ensureReferralsConstraint();
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  if (!allColumns.includes('MRN')) {
+    throw new Error('Referrals table must contain an MRN column');
+  }
+
+  const tableColumns = allColumns.filter(c => c !== 'MRN');
+
+  const typeRes = await client.query(`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
+  `, [tableName]);
+
+  const isDateCol = {};
+  typeRes.rows.forEach(row => {
+    const type = (row.data_type || '').toLowerCase();
+    isDateCol[row.column_name] = type.includes('date') || type.includes('time');
+  });
+
+  dateColumn = tableColumns.find(c => /date/i.test(c) && isDateCol[c]) ||
+               allColumns.find(c => isDateCol[c]) ||
+               null;
+
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+
+      const rawMrn = row['MRN'];
+      const mrn = toNullIfEmpty(rawMrn);
+      const action = (row['Action'] || '').toUpperCase();
+      const dateStr = dateColumn
+        ? (isDateCol[dateColumn] ? normalizeDateForPg(row[dateColumn]) : row[dateColumn])
+        : null;
+
+      if (dateStr) {
+        const d = new Date(dateStr);
+        if (!isNaN(d)) {
+          if (!minDate || d < minDate) minDate = d;
+          if (!maxDate || d > maxDate) maxDate = d;
+        }
+      }
+
+      if (!mrn) {
+        skippedRows.push({ row, reason: 'Missing MRN' });
+        continue;
+      }
+
+      csvMrns.add(mrn);
+
+      if (action === 'DELETE') {
+        deleteIds.add(mrn);
+        continue;
+      }
+
+      const rowData = tableColumns.map(column => {
+        const value = row[column];
+        return isDateCol[column] ? normalizeDateForPg(value) : toNullIfEmpty(value);
+      });
+
+      batch.push({ keys: [mrn], rowData });
+
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, ['MRN']);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, ['MRN']);
+      insertedOrUpdated += batch.length;
+    }
+
+    if (deleteIds.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "MRN" = ANY($1)`,
+        [Array.from(deleteIds)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (dateColumn && minDate && maxDate && csvMrns.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "${dateColumn}" BETWEEN $1 AND $2 AND "MRN" NOT IN (SELECT unnest($3::text[]))`,
+        [minDate, maxDate, Array.from(csvMrns)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
     return {
       processedRows,
