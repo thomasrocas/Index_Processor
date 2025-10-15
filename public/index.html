@@ -51,8 +51,8 @@
         <option value="maintable">Main Table</option>
         <option value="billed_ar_aging">Billed AR Aging</option>
         <option value="queue_manager">Queue Manager</option>
-        <!-- ✅ FIX: send correct table name for Unduplicated importer -->
         <option value="unduplicatedpatients">Unduplicated Census</option>
+        <option value="admissions">Admissions</option>
         <option value="active_agency">Active Agency Census</option>
         <option value="pdgm">PDGM</option>
         <option value="referrals">Referrals</option>
@@ -64,7 +64,7 @@
 
       <button type="submit">Upload</button>
     </form>
-    <div class="muted">Tip: Main Table requires a "Visit ID". Raw Data requires an "Admission ID". Unduplicated, PDGM, and Referrals require an "MRN" key.</div>
+    <div class="muted">Tip: Main Table requires a "Visit ID". Raw Data requires an "Admission ID". Unduplicated and Referrals use an "MRN" key. Admissions uses the combination of "MRN" and "Admission Date".</div>
     <div id="status"></div>
   </div>
 
@@ -79,7 +79,6 @@
       const file = fileInput.files[0];
       if (!file) return alert("Please select a file.");
 
-      // Show which table name will be sent (sanity check)
       statusBox.textContent = "Uploading to table: " + tableName + "\n";
 
       if (tableName === "maintable") {
@@ -100,13 +99,11 @@
         .catch(err => statusBox.textContent += "❌ Error: " + err);
     }
 
-    // Only for Main Table pre-processing (recert date columns)
     function processAndUploadCSV(file, tableName) {
       Papa.parse(file, {
         complete: function(results) {
           let data = results.data;
 
-          // Remove blank header columns
           for (let col = data[0].length - 1; col >= 0; col--) {
             if ((data[0][col] || "").trim() === "") {
               data.forEach(row => {
@@ -115,13 +112,11 @@
             }
           }
 
-          // ✅ FIX: Trim both left and right whitespace on headers
           data[0] = data[0].map(h => (h || "").trim());
 
           const socDateIndex = data[0].indexOf("SOC Date");
           const visitStartDateIndex = data[0].indexOf("Visit Start Date");
 
-          // Add computed headers
           data[0].push("cRecertDate_Current", "cRecertDate_Next", "cRecertDate_End");
 
           for (let i = 1; i < data.length; i++) {
@@ -148,34 +143,35 @@
             data[i].push(cRecertDateCurrent, cRecertDateNext, cRecertDateEnd);
           }
 
-          // Turn back into CSV string
           const modifiedCSV = Papa.unparse(data);
           const blob = new Blob([modifiedCSV], { type: "text/csv" });
           const processedFile = new File([blob], "processed_" + file.name, { type: "text/csv" });
 
-          // Upload processed file
           uploadDirect(processedFile, tableName);
         }
       });
     }
 
-    function calculateCRecertDate(socDate, visitStartDate) {
-      let cRecertDateCurrent = new Date(socDate.getTime());
-      let nextSOCDate = new Date(socDate.getTime());		
-      while (nextSOCDate <= visitStartDate) {
-        cRecertDateCurrent = new Date(nextSOCDate.getTime());
-        nextSOCDate.setDate(nextSOCDate.getDate() + 60);
-      }
-      return cRecertDateCurrent;
+    function parseDate(value) {
+      if (!value) return null;
+      const parts = value.split('/');
+      if (parts.length !== 3) return null;
+      const [month, day, year] = parts.map(Number);
+      if (!month || !day || !year) return null;
+      return new Date(year < 100 ? 2000 + year : year, month - 1, day);
     }
 
-    function parseDate(dateStr) {
-      let date = new Date(dateStr);
-      return isNaN(date) ? null : date;
+    function calculateCRecertDate(socDate, visitStartDate) {
+      const diff = Math.floor((visitStartDate - socDate) / (1000 * 60 * 60 * 24));
+      if (diff < 0) return null;
+      return new Date(socDate.getTime() + diff * 24 * 60 * 60 * 1000);
     }
 
     function formatDate(date) {
-      return date ? `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')}/${date.getFullYear()}` : "";
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      return `${year}-${month}-${day}`;
     }
   </script>
 </body>

@@ -198,6 +198,24 @@ async function ensureReferralsConstraint() {
   `);
 }
 
+async function ensureAdmissionsConstraint() {
+  await client.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'admissions'
+          AND indexname = 'admissions_mrn_admission_date_uniq'
+      ) THEN
+        EXECUTE 'CREATE UNIQUE INDEX admissions_mrn_admission_date_uniq
+                 ON public.admissions("MRN", "Admission Date")';
+      END IF;
+    END$$;
+  `);
+}
+
 
 async function ensurePdgmConstraint() {
   const colRes = await client.query(`
@@ -328,6 +346,19 @@ if (tableName === 'casemanager') {
 
   return res.send(`
     ✅ UnduplicatedPatients Done!
+    Processed Rows: ${summary.processedRows}
+    Inserted/Updated: ${summary.insertedOrUpdated}
+    Deleted Rows: ${summary.deletedCount}
+    Skipped Rows: ${summary.skippedRows}
+  `);
+
+} else if (tableName === 'admissions') {
+  const summary = await importAdmissions(filePath, tableName);
+  const actor = resolveActor(req);
+  await appendImportLog(actor, summary, "importAdmissions");
+
+  return res.send(`
+    ✅ Admissions Done!
     Processed Rows: ${summary.processedRows}
     Inserted/Updated: ${summary.insertedOrUpdated}
     Deleted Rows: ${summary.deletedCount}
@@ -699,6 +730,135 @@ async function importUnduplicatedPatients(filePath, tableName) {
 
     await client.query('COMMIT');
     fs.unlinkSync(filePath);
+
+    return {
+      processedRows,
+      insertedOrUpdated,
+      deletedCount,
+      skippedRows: skippedRows.length,
+    };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    throw err;
+  }
+}
+
+// ------------------ ADMISSIONS IMPORT ------------------
+async function importAdmissions(filePath, tableName) {
+  const BATCH_SIZE = 500;
+  const keyColumns = ['MRN', 'Admission Date'];
+  let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
+  const skippedRows = [];
+  const deleteKeys = new Set();
+  const csvKeys = new Set();
+  let minDate = null;
+  let maxDate = null;
+
+  await ensureAdmissionsConstraint();
+
+  const result = await client.query(`
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
+    ORDER BY ordinal_position
+  `, [tableName]);
+
+  const allColumns = result.rows.map(r => r.column_name);
+  for (const col of keyColumns) {
+    if (!allColumns.includes(col)) {
+      throw new Error(`Admissions table must contain a "${col}" column`);
+    }
+  }
+
+  const tableColumns = allColumns.filter(c => !keyColumns.includes(c));
+
+  const typeRes = await client.query(`
+    SELECT column_name, data_type
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = $1
+  `, [tableName]);
+
+  const isDateCol = {};
+  typeRes.rows.forEach(row => {
+    const type = (row.data_type || '').toLowerCase();
+    isDateCol[row.column_name] = type.includes('date') || type.includes('time');
+  });
+
+  await client.query('BEGIN');
+
+  try {
+    let batch = [];
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+
+    for await (const row of parser) {
+      processedRows++;
+
+      const rawMrn = row['MRN'];
+      const mrn = toNullIfEmpty(rawMrn);
+      const admissionDateRaw = row['Admission Date'];
+      const admissionDate = normalizeDateForPg(admissionDateRaw);
+      const action = (row['Action'] || '').toUpperCase();
+
+      if (!mrn || !admissionDate) {
+        skippedRows.push({ row, reason: 'Missing MRN or Admission Date' });
+        continue;
+      }
+
+      const compositeKey = `${mrn}|${admissionDate}`;
+      csvKeys.add(compositeKey);
+
+      const dateObj = new Date(admissionDate);
+      if (!isNaN(dateObj)) {
+        if (!minDate || dateObj < minDate) minDate = dateObj;
+        if (!maxDate || dateObj > maxDate) maxDate = dateObj;
+      }
+
+      if (action === 'DELETE') {
+        deleteKeys.add(compositeKey);
+        continue;
+      }
+
+      const rowData = tableColumns.map(column => {
+        const value = row[column];
+        return isDateCol[column] ? normalizeDateForPg(value) : toNullIfEmpty(value);
+      });
+
+      batch.push({ keys: [mrn, admissionDate], rowData });
+
+      if (batch.length >= BATCH_SIZE) {
+        await processBatch(batch, tableName, tableColumns, keyColumns);
+        insertedOrUpdated += batch.length;
+        batch = [];
+      }
+    }
+
+    if (batch.length) {
+      await processBatch(batch, tableName, tableColumns, keyColumns);
+      insertedOrUpdated += batch.length;
+    }
+
+    const compositeExpr =
+      `COALESCE("MRN"::text,'') || '|' || COALESCE(to_char("Admission Date",'YYYY-MM-DD'),'')`;
+
+    if (deleteKeys.size) {
+      const deleteRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE ${compositeExpr} = ANY($1)`,
+        [Array.from(deleteKeys)]
+      );
+      deletedCount += deleteRes.rowCount;
+    }
+
+    if (minDate && maxDate && csvKeys.size) {
+      const deleteExistingRes = await client.query(
+        `DELETE FROM "${tableName}" WHERE "Admission Date" BETWEEN $1 AND $2 AND NOT (${compositeExpr} = ANY($3))`,
+        [minDate, maxDate, Array.from(csvKeys)]
+      );
+      deletedCount += deleteExistingRes.rowCount;
+    }
+
+    await client.query('COMMIT');
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
     return {
       processedRows,
@@ -1446,9 +1606,11 @@ if (process.env.NODE_ENV === 'test') {
     processBatch,
     setClientForTesting,
     normalizeDateForPg,
+    importAdmissions,
     importAdmissionIdTable,
     importActiveAgency,
     importRawData,
+    ensureAdmissionsConstraint,
     ensureActiveAgencyConstraint,
     ensureRawDataConstraint,
   };
