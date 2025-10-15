@@ -23,6 +23,10 @@ class FakeClient {
       return { rowCount: 0 };
     }
 
+    if (/^DO\s+\$\$/i.test(normalizedSql)) {
+      return { rowCount: 0 };
+    }
+
     if (/FROM\s+information_schema\.columns/i.test(normalizedSql)) {
       if (/is_generated\s*=\s*'NEVER'/i.test(normalizedSql)) {
         return {
@@ -82,31 +86,65 @@ class FakeClient {
     }
 
     if (deleteRegex.test(normalizedSql)) {
-      if (/BETWEEN\s+\$1\s+AND\s+\$2/i.test(normalizedSql)) {
-        return { rowCount: 0 };
+      const notAnyMatch = normalizedSql.match(/NOT\s*\(\s*[\s\S]*?=\s*ANY\(\$(\d+)\)\s*\)/i);
+      if (notAnyMatch) {
+        const paramIndex = parseInt(notAnyMatch[1], 10) - 1;
+        const keepValues = Array.isArray(params[paramIndex]) ? params[paramIndex] : [];
+        const keepSet = new Set(
+          keepValues.map(v => (v === null || v === undefined ? v : String(v)))
+        );
+        let deleted = 0;
+
+        for (const key of Array.from(this.storage.keys())) {
+          const normalizedKey = key === null || key === undefined ? key : String(key);
+          if (!keepSet.has(normalizedKey)) {
+            this.storage.delete(key);
+            deleted++;
+          }
+        }
+
+        return { rowCount: deleted };
       }
 
       const whereMatch = normalizedSql.match(/WHERE\s+"([^"]+)"\s*=\s*ANY\(\$(\d+)\)/i);
-      if (!whereMatch) {
-        return { rowCount: 0 };
-      }
+      if (whereMatch) {
+        const keyColumn = whereMatch[1];
+        const paramIndex = parseInt(whereMatch[2], 10) - 1;
+        const ids = Array.isArray(params[paramIndex]) ? params[paramIndex] : [];
+        const idSet = new Set(ids.map(v => (v === null || v === undefined ? v : String(v))));
+        let deleted = 0;
 
-      const keyColumn = whereMatch[1];
-      const paramIndex = parseInt(whereMatch[2], 10) - 1;
-      const ids = Array.isArray(params[paramIndex]) ? params[paramIndex] : [];
-      const idSet = new Set(ids.map(v => (v === null || v === undefined ? v : String(v))));
-      let deleted = 0;
-
-      for (const [key, record] of Array.from(this.storage.entries())) {
-        const value = record[keyColumn];
-        const normalizedValue = value === null || value === undefined ? value : String(value);
-        if (idSet.has(normalizedValue)) {
-          this.storage.delete(key);
-          deleted++;
+        for (const [key, record] of Array.from(this.storage.entries())) {
+          const value = record[keyColumn];
+          const normalizedValue = value === null || value === undefined ? value : String(value);
+          if (idSet.has(normalizedValue)) {
+            this.storage.delete(key);
+            deleted++;
+          }
         }
+
+        return { rowCount: deleted };
       }
 
-      return { rowCount: deleted };
+      const anyMatch = normalizedSql.match(/=\s*ANY\(\$(\d+)\)/i);
+      if (anyMatch) {
+        const paramIndex = parseInt(anyMatch[1], 10) - 1;
+        const keys = Array.isArray(params[paramIndex]) ? params[paramIndex] : [];
+        const keySet = new Set(keys.map(v => (v === null || v === undefined ? v : String(v))));
+        let deleted = 0;
+
+        for (const key of Array.from(this.storage.keys())) {
+          const normalizedKey = key === null || key === undefined ? key : String(key);
+          if (keySet.has(normalizedKey)) {
+            this.storage.delete(key);
+            deleted++;
+          }
+        }
+
+        return { rowCount: deleted };
+      }
+
+      return { rowCount: 0 };
     }
 
     throw new Error(`FakeClient received unsupported query: ${sql}`);
