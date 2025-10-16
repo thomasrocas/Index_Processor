@@ -1498,7 +1498,7 @@ async function importQueueManager(filePath, tableName) {
 
   const result = await client.query(
     `
-    SELECT column_name
+    SELECT column_name, data_type, character_maximum_length
     FROM information_schema.columns
     WHERE table_schema = 'public' AND table_name = $1 AND is_generated = 'NEVER'
     ORDER BY ordinal_position
@@ -1506,13 +1506,25 @@ async function importQueueManager(filePath, tableName) {
     [tableName]
   );
 
+  const columnMeta = new Map(
+    result.rows.map(r => [r.column_name, {
+      dataType: r.data_type,
+      maxLength: r.character_maximum_length,
+    }])
+  );
+
   const allColumns = result.rows.map(r => r.column_name);
   const keyColumn = 'QueueID';
   const tableColumns = allColumns.filter(c => c !== keyColumn);
   const dateColumn = allColumns.find(c => /date/i.test(c));
 
-  // Build a simple name-based date column map (no type lookup needed)
-  const isDateCol = {}; allColumns.forEach(c => { isDateCol[c] = /date/i.test(c); });
+  const isDateCol = {};
+  for (const [columnName, meta] of columnMeta.entries()) {
+    const dataType = meta.dataType || '';
+    isDateCol[columnName] = /date/i.test(dataType) || /date/i.test(columnName);
+  }
+
+  const keyColumnMeta = columnMeta.get(keyColumn);
 
   await client.query('BEGIN');
 
@@ -1522,7 +1534,8 @@ async function importQueueManager(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
-      const id = row[keyColumn];
+      const idRaw = row[keyColumn];
+      const id = typeof idRaw === 'string' ? idRaw.trim() : idRaw;
       const action = (row['Action'] || '').toUpperCase();
 
       const dateStr = dateColumn ? (isDateCol[dateColumn] ? normalizeDateForPg(row[dateColumn]) : row[dateColumn]) : null;
@@ -1539,6 +1552,18 @@ async function importQueueManager(filePath, tableName) {
         continue;
       }
 
+      if (
+        keyColumnMeta?.maxLength != null &&
+        typeof id === 'string' &&
+        id.length > keyColumnMeta.maxLength
+      ) {
+        skippedRows.push({
+          row,
+          reason: `Key column exceeds maximum length of ${keyColumnMeta.maxLength}`,
+        });
+        continue;
+      }
+
       csvIds.add(id);
 
       if (action === 'DELETE') {
@@ -1547,8 +1572,25 @@ async function importQueueManager(filePath, tableName) {
       }
 
       const rowData = tableColumns.map(c => {
-        const v = row[c];
-        return isDateCol[c] ? normalizeDateForPg(v) : toNullIfEmpty(v);
+        let value = row[c];
+
+        if (isDateCol[c]) {
+          value = normalizeDateForPg(value);
+        } else {
+          value = toNullIfEmpty(value);
+        }
+
+        if (
+          value !== null &&
+          typeof value === 'string'
+        ) {
+          const maxLength = columnMeta.get(c)?.maxLength;
+          if (typeof maxLength === 'number' && value.length > maxLength) {
+            value = value.slice(0, maxLength);
+          }
+        }
+
+        return value;
       });
 
       batch.push({ keys: [id], rowData });
