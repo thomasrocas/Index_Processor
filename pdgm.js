@@ -33,6 +33,110 @@ if (!isTestEnv) {
   app.use(express.urlencoded({ extended: true }));
 }
 
+const importProgressStore = new Map();
+const PROGRESS_CLEANUP_MS = 10 * 60 * 1000; // 10 minutes
+
+function generateImportId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createImportSession(tableName) {
+  const id = generateImportId();
+  const entry = {
+    id,
+    tableName,
+    status: 'queued',
+    processedRows: 0,
+    totalRows: 0,
+    percentage: 0,
+    summary: null,
+    message: '',
+    error: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  importProgressStore.set(id, entry);
+  return entry;
+}
+
+function updateImportSession(id, updates = {}) {
+  const entry = importProgressStore.get(id);
+  if (!entry) return null;
+
+  if (typeof updates.totalRows === 'number') {
+    entry.totalRows = updates.totalRows;
+  }
+  if (typeof updates.processedRows === 'number') {
+    entry.processedRows = updates.processedRows;
+  }
+  if (typeof updates.status === 'string') {
+    entry.status = updates.status;
+  }
+  if (typeof updates.message === 'string') {
+    entry.message = updates.message;
+  }
+  if (updates.summary !== undefined) {
+    entry.summary = updates.summary;
+  }
+  if (updates.error !== undefined) {
+    entry.error = updates.error;
+  }
+
+  entry.percentage = entry.totalRows > 0
+    ? Math.min(100, Math.round((entry.processedRows / entry.totalRows) * 100))
+    : 0;
+  entry.updatedAt = Date.now();
+  return entry;
+}
+
+function completeImportSession(id, summary, message) {
+  const entry = updateImportSession(id, {
+    status: 'completed',
+    processedRows: summary?.processedRows ?? 0,
+    summary,
+    message,
+  });
+  if (entry) {
+    entry.completedAt = Date.now();
+    scheduleImportCleanup(id);
+  }
+}
+
+function failImportSession(id, error) {
+  const entry = updateImportSession(id, {
+    status: 'failed',
+    error: error instanceof Error ? error.message : String(error),
+  });
+  if (entry) {
+    entry.completedAt = Date.now();
+    scheduleImportCleanup(id);
+  }
+}
+
+function scheduleImportCleanup(id) {
+  if (isTestEnv) return; // tests rely on deterministic state
+  setTimeout(() => importProgressStore.delete(id), PROGRESS_CLEANUP_MS).unref?.();
+}
+
+function getImportSessionSnapshot(id) {
+  const entry = importProgressStore.get(id);
+  if (!entry) return null;
+  return { ...entry };
+}
+
+async function countCsvRecords(filePath) {
+  let count = 0;
+  try {
+    const parser = fs.createReadStream(filePath).pipe(parse(CSV_OPTS_TOLERANT));
+    for await (const _row of parser) {
+      count++;
+    }
+  } catch (err) {
+    throw err;
+  }
+  return count;
+}
+
 function setClientForTesting(testClient) {
   client = testClient;
 }
@@ -307,157 +411,158 @@ async function appendImportLog(actor, summary, funcName) {
 
 
 
+function buildSummaryMessage(label, summary) {
+  if (!summary) return '';
+  return [
+    `✅ ${label} Done!`,
+    `Processed Rows: ${summary.processedRows}`,
+    `Inserted/Updated: ${summary.insertedOrUpdated}`,
+    `Deleted Rows: ${summary.deletedCount}`,
+    `Skipped Rows: ${summary.skippedRows}`,
+  ].join('\n');
+}
+
+const IMPORT_CONFIG = {
+  casemanager: {
+    runner: (filePath, tableName, options) => importCaseManager(filePath, tableName, null, options),
+    logName: 'importCaseManager',
+    formatMessage: (summary) => buildSummaryMessage('CaseManager', summary),
+  },
+  maintable: {
+    runner: (filePath, tableName, options) => importMainTable(filePath, tableName, options),
+    logName: 'importMainTable',
+    formatMessage: (summary) => buildSummaryMessage('MainTable', summary),
+  },
+  unduplicatedpatients: {
+    runner: (filePath, tableName, options) => importUnduplicatedPatients(filePath, tableName, options),
+    logName: 'importUnduplicatedPatients',
+    formatMessage: (summary) => buildSummaryMessage('UnduplicatedPatients', summary),
+  },
+  admissions: {
+    runner: (filePath, tableName, options) => importAdmissions(filePath, tableName, options),
+    logName: 'importAdmissions',
+    formatMessage: (summary) => buildSummaryMessage('Admissions', summary),
+  },
+  active_agency: {
+    runner: (filePath, tableName, options) => importActiveAgency(filePath, tableName, options),
+    logName: 'importActiveAgency',
+    formatMessage: (summary) => buildSummaryMessage('Import ActiveAgency', summary),
+  },
+  raw_data: {
+    runner: (filePath, tableName, options) => importRawData(filePath, tableName, options),
+    logName: 'importRawData',
+    formatMessage: (summary) => buildSummaryMessage('Import RawData', summary),
+  },
+  pdgm: {
+    runner: (filePath, tableName, options) => importPdgm(filePath, tableName, options),
+    logName: 'importPdgm',
+    formatMessage: (summary) => buildSummaryMessage('Import PDGM', summary),
+  },
+  billed_ar_aging: {
+    runner: (filePath, tableName, options) => importBilledArAging(filePath, tableName, options),
+    logName: 'importBilledArAging',
+    afterImport: async () => {
+      await client.query('SELECT public.refresh_all_rollups()');
+    },
+    formatMessage: (summary) => buildSummaryMessage('Billed AR Aging', summary),
+  },
+  queue_manager: {
+    runner: (filePath, tableName, options) => importQueueManager(filePath, tableName, options),
+    logName: 'importQueueManager',
+    afterImport: async () => {
+      await client.query('SELECT public.refresh_all_rollups()');
+    },
+    formatMessage: (summary) => buildSummaryMessage('Queue Manager', summary),
+  },
+  referrals: {
+    runner: (filePath, tableName, options) => importReferrals(filePath, tableName, options),
+    logName: 'importReferrals',
+    formatMessage: (summary) => buildSummaryMessage('Referrals', summary),
+  },
+};
+
 // ------------------ ROUTES ------------------
 app.post('/upload', upload.single('csvfile'), async (req, res) => {
   const tableNameRaw = req.body.tableName;
   const tableName = (tableNameRaw ?? '').toString().trim().toLowerCase();
   const filePath = req.file?.path;
 
-  if (!filePath) return res.status(400).send('No file uploaded.');
+  if (!filePath) return res.status(400).json({ error: 'No file uploaded.' });
   if (!tableName) {
     fs.unlinkSync(filePath);
-    return res.status(400).send('No table selected.');
+    return res.status(400).json({ error: 'No table selected.' });
   }
 
-  try {
-if (tableName === 'casemanager') {
-  await importCaseManager(filePath, tableName, res);
-  const actor = resolveActor(req);
-  // importCaseManager doesn’t return summary → log placeholder
-  await appendImportLog(actor, { processedRows: 0, insertedOrUpdated: 0, deletedCount: 0, skippedRows: 0 }, "importCaseManager");
+  const config = IMPORT_CONFIG[tableName];
+  if (!config) {
+    fs.unlinkSync(filePath);
+    return res.status(400).json({ error: '❌ Unknown table selected.' });
+  }
 
-} else if (tableName === 'maintable') {
-  const summary = await importMainTable(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importMainTable");
+  const session = createImportSession(tableName);
+  res.status(202).json({ importId: session.id, status: session.status });
 
-  return res.send(`
-    ✅ MainTable Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
+  (async () => {
+    try {
+      let totalRows = 0;
+      try {
+        totalRows = await countCsvRecords(filePath);
+        updateImportSession(session.id, { totalRows, status: 'importing', processedRows: 0 });
+      } catch (countErr) {
+        console.warn('⚠️ Failed to count CSV rows for progress tracking', countErr);
+        updateImportSession(session.id, { status: 'importing', processedRows: 0 });
+      }
 
-} else if (tableName === 'unduplicatedpatients') {
-  const summary = await importUnduplicatedPatients(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importUnduplicatedPatients");
+      const onProgress = (processed) => updateImportSession(session.id, { processedRows: processed });
+      const options = { onProgress, totalRows };
+      let summary = await config.runner(filePath, tableName, options);
 
-  return res.send(`
-    ✅ UnduplicatedPatients Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
+      if (!summary) {
+        summary = {
+          processedRows: totalRows,
+          insertedOrUpdated: totalRows,
+          deletedCount: 0,
+          skippedRows: 0,
+        };
+      }
 
-} else if (tableName === 'admissions') {
-  const summary = await importAdmissions(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importAdmissions");
+      updateImportSession(session.id, { processedRows: summary.processedRows });
 
-  return res.send(`
-    ✅ Admissions Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
+      if (typeof config.afterImport === 'function') {
+        await config.afterImport(summary, tableName);
+      }
 
-  } else if (tableName === 'active_agency') {
-    const summary = await importActiveAgency(filePath, tableName);
-    const actor = resolveActor(req);
-    await appendImportLog(actor, summary, "importActiveAgency");
+      const message = config.formatMessage
+        ? config.formatMessage(summary, tableName)
+        : buildSummaryMessage(tableName, summary);
 
-    return res.send(`
-      ✅ Import ActiveAgency Done!
-      Processed Rows: ${summary.processedRows}
-      Inserted/Updated: ${summary.insertedOrUpdated}
-      Deleted Rows: ${summary.deletedCount}
-      Skipped Rows: ${summary.skippedRows}
-    `);
+      completeImportSession(session.id, summary, message);
 
-  } else if (tableName === 'raw_data') {
-    const summary = await importRawData(filePath, tableName);
-    const actor = resolveActor(req);
-    await appendImportLog(actor, summary, "importRawData");
-
-    return res.send(`
-      ✅ Import RawData Done!
-      Processed Rows: ${summary.processedRows}
-      Inserted/Updated: ${summary.insertedOrUpdated}
-      Deleted Rows: ${summary.deletedCount}
-      Skipped Rows: ${summary.skippedRows}
-    `);
-
-  } else if (tableName === 'pdgm') {
-  const summary = await importPdgm(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importPdgm");
-
-  return res.send(`
-    ✅ Import PDGM Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
-
-} else if (tableName === 'billed_ar_aging') {
-  const summary = await importBilledArAging(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importBilledArAging");
- // Belt-and-suspenders: ensure RFNP is synced after the import
-  await client.query('SELECT public.refresh_all_rollups()');
-
-  return res.send(`
-    ✅ Billed AR Aging Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
-
-} else if (tableName === 'queue_manager') {
-  const summary = await importQueueManager(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importQueueManager");
-  // Ensure RFNP reflects any QM changes from this batch
-  await client.query('SELECT public.refresh_all_rollups()');
-
-  return res.send(`
-    ✅ Queue Manager Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
-} else if (tableName === 'referrals') {
-  const summary = await importReferrals(filePath, tableName);
-  const actor = resolveActor(req);
-  await appendImportLog(actor, summary, "importReferrals");
-
-  return res.send(`
-    ✅ Referrals Done!
-    Processed Rows: ${summary.processedRows}
-    Inserted/Updated: ${summary.insertedOrUpdated}
-    Deleted Rows: ${summary.deletedCount}
-    Skipped Rows: ${summary.skippedRows}
-  `);
-} else {
-      fs.unlinkSync(filePath);
-      return res.status(400).send('❌ Unknown table selected.');
+      if (config.logName) {
+        const actor = resolveActor(req);
+        await appendImportLog(actor, summary, config.logName);
+      }
+    } catch (err) {
+      console.error('❌ Import job error:', err);
+      try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch (_) {}
+      failImportSession(session.id, err);
     }
-  } catch (err) {
-    console.error('❌ Server error:', err);
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    res.status(500).send(`<pre>Server error: ${err.message}</pre>`);
+  })();
+});
+
+app.get('/progress/:id', (req, res) => {
+  const snapshot = getImportSessionSnapshot(req.params.id);
+  if (!snapshot) {
+    return res.status(404).json({ status: 'not_found', importId: req.params.id });
   }
+  return res.json(snapshot);
 });
 
 // ------------------ CASEMANAGER IMPORT ------------------
-async function importCaseManager(filePath, tableName, res) {
+async function importCaseManager(filePath, tableName, res, options = {}) {
+  const { onProgress } = options;
   try {
     const result = await client.query(`
       SELECT column_name, data_type
@@ -483,10 +588,14 @@ async function importCaseManager(filePath, tableName, res) {
       isDateCol[name] = /\bdate\b/i.test(typ);
     }
 
+    let processedRows = 0;
     const reorderAndSanitize = new Transform({
       writableObjectMode: true,
       readableObjectMode: true,
       transform(record, _enc, cb) {
+        processedRows++;
+        if (typeof onProgress === 'function') onProgress(processedRows);
+
         const out = [];
         for (const col of tableColumns) {
           const plain = col.replace(/(^")|("$)/g, '');
@@ -502,16 +611,30 @@ async function importCaseManager(filePath, tableName, res) {
       `COPY "${tableName}" (${tableColumns.join(',')}) FROM STDIN CSV NULL ''`
     ));
 
-    fs.createReadStream(filePath)
+    const formattedStream = fs.createReadStream(filePath)
       .pipe(parse({ columns: true, trim: true }))
       .pipe(reorderAndSanitize)
-      .pipe(stringify({ header: false }))
-      .pipe(copyStream)
-      .on('finish', () => {
-        fs.unlinkSync(filePath);
-        res.send(`✅ CaseManager: Table "${tableName}" imported successfully!`);
-      })
-      .on('error', err => { copyStream.destroy(err); });
+      .pipe(stringify({ header: false }));
+
+    const pipelinePromise = new Promise((resolve, reject) => {
+      formattedStream.pipe(copyStream);
+      copyStream.on('finish', resolve);
+      copyStream.on('error', reject);
+      formattedStream.on('error', reject);
+    });
+
+    await pipelinePromise;
+    fs.unlinkSync(filePath);
+    if (res) {
+      res.send(`✅ CaseManager: Table "${tableName}" imported successfully!`);
+    }
+
+    return {
+      processedRows,
+      insertedOrUpdated: processedRows,
+      deletedCount: 0,
+      skippedRows: 0,
+    };
 
   } catch (err) {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -520,7 +643,8 @@ async function importCaseManager(filePath, tableName, res) {
 }
 
 // ------------------ MAINTABLE IMPORT ------------------
-async function importMainTable(filePath, tableName) {
+async function importMainTable(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -547,6 +671,7 @@ async function importMainTable(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
       const visitId = row['Visit ID'];
       const action = (row['Action'] || '').toUpperCase();
       const dateStr = dateColumn ? row[dateColumn] : null;
@@ -649,7 +774,8 @@ async function processBatch(batch, tableName, tableColumns, keyColumns) {
 }
 
 // ------------------ UNDUPLICATEDPATIENTS IMPORT ------------------
-async function importUnduplicatedPatients(filePath, tableName) {
+async function importUnduplicatedPatients(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -676,6 +802,7 @@ async function importUnduplicatedPatients(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
       const mrn = row['MRN'];
       const action = (row['Action'] || '').toUpperCase();
       const dateStr = dateColumn ? row[dateColumn] : null;
@@ -745,7 +872,8 @@ async function importUnduplicatedPatients(filePath, tableName) {
 }
 
 // ------------------ ADMISSIONS IMPORT ------------------
-async function importAdmissions(filePath, tableName) {
+async function importAdmissions(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   const keyColumns = ['MRN', 'Admission Date'];
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
@@ -793,6 +921,7 @@ async function importAdmissions(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
 
       const rawMrn = row['MRN'];
       const mrn = toNullIfEmpty(rawMrn);
@@ -873,7 +1002,8 @@ async function importAdmissions(filePath, tableName) {
   }
 }
 
-async function importReferrals(filePath, tableName) {
+async function importReferrals(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -922,6 +1052,7 @@ async function importReferrals(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
 
       const rawMrn = row['MRN'];
       const mrn = toNullIfEmpty(rawMrn);
@@ -1003,7 +1134,7 @@ async function importReferrals(filePath, tableName) {
 
 // ------------------ ADMISSION-ID IMPORT HELPERS ------------------
 
-async function importAdmissionIdTable({ filePath, tableName, ensureConstraint }) {
+async function importAdmissionIdTable({ filePath, tableName, ensureConstraint, onProgress }) {
   const BATCH_SIZE = 500;
   let processedRows = 0;
   let insertedOrUpdated = 0;
@@ -1114,6 +1245,7 @@ async function importAdmissionIdTable({ filePath, tableName, ensureConstraint })
       }
 
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
 
       const rawAdmissionId = admissionHeader ? row[admissionHeader] : row[keyColumn];
       const admissionId = sanitizeColumnValue(keyColumn, rawAdmissionId);
@@ -1190,24 +1322,27 @@ async function importAdmissionIdTable({ filePath, tableName, ensureConstraint })
   }
 }
 
-async function importActiveAgency(filePath, tableName) {
+async function importActiveAgency(filePath, tableName, options = {}) {
   return importAdmissionIdTable({
     filePath,
     tableName,
     ensureConstraint: ensureActiveAgencyConstraint,
+    onProgress: options.onProgress,
   });
 }
 
-async function importRawData(filePath, tableName) {
+async function importRawData(filePath, tableName, options = {}) {
   return importAdmissionIdTable({
     filePath,
     tableName,
     ensureConstraint: ensureRawDataConstraint,
+    onProgress: options.onProgress,
   });
 }
 
 // ------------------ PDGM IMPORT ------------------
-async function importPdgm(filePath, tableName) {
+async function importPdgm(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -1295,6 +1430,7 @@ async function importPdgm(filePath, tableName) {
       }
 
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
 
       const actionRaw = row[resolveHeader('Action')];
       const action = (actionRaw || '').toUpperCase();
@@ -1382,7 +1518,8 @@ async function importPdgm(filePath, tableName) {
 }
 
 // ------------------ BILLED AR AGING IMPORT ------------------
-async function importBilledArAging(filePath, tableName) {
+async function importBilledArAging(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -1412,6 +1549,7 @@ async function importBilledArAging(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
       const keys = keyColumns.map(k => row[k]);
       const action = (row['Action'] || '').toUpperCase();
       const dateStr = dateColumn ? row[dateColumn] : null;
@@ -1486,7 +1624,8 @@ async function importBilledArAging(filePath, tableName) {
 }
 
 // ------------------ QUEUE MANAGER IMPORT ------------------
-async function importQueueManager(filePath, tableName) {
+async function importQueueManager(filePath, tableName, options = {}) {
+  const { onProgress } = options;
   const BATCH_SIZE = 500;
   let processedRows = 0, insertedOrUpdated = 0, deletedCount = 0;
   const skippedRows = [];
@@ -1534,6 +1673,7 @@ async function importQueueManager(filePath, tableName) {
 
     for await (const row of parser) {
       processedRows++;
+      if (typeof onProgress === 'function') onProgress(processedRows);
       const idRaw = row[keyColumn];
       const id = typeof idRaw === 'string' ? idRaw.trim() : idRaw;
       const action = (row['Action'] || '').toUpperCase();

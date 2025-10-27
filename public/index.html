@@ -71,6 +71,7 @@
   <script>
     const form = document.getElementById("uploadForm");
     const statusBox = document.getElementById("status");
+    let progressWatcher = null;
 
     form.addEventListener("submit", function(e) {
       e.preventDefault();
@@ -79,7 +80,7 @@
       const file = fileInput.files[0];
       if (!file) return alert("Please select a file.");
 
-      statusBox.textContent = "Uploading to table: " + tableName + "\n";
+      statusBox.textContent = "Uploading to table: " + tableName + "\nPreparing import...";
 
       if (tableName === "maintable") {
         processAndUploadCSV(file, tableName);
@@ -88,15 +89,148 @@
       }
     });
 
-    function uploadDirect(file, tableName) {
+    async function uploadDirect(file, tableName) {
       const formData = new FormData();
       formData.append("csvfile", file);
       formData.append("tableName", tableName);
 
-      fetch("/upload", { method: "POST", body: formData })
-        .then(res => res.text())
-        .then(msg => statusBox.textContent += msg)
-        .catch(err => statusBox.textContent += "❌ Error: " + err);
+      try {
+        const response = await fetch("/upload", { method: "POST", body: formData });
+        const payload = await readJsonResponse(response);
+        if (!payload.importId) {
+          throw new Error(payload.error || "Import session could not be created.");
+        }
+
+        statusBox.textContent = [
+          `Import queued for ${tableName}.`,
+          `Import ID: ${payload.importId}`,
+          "Awaiting progress..."
+        ].join("\n");
+
+        startProgressWatcher(payload.importId);
+      } catch (err) {
+        statusBox.textContent += `\n❌ ${err.message}`;
+      }
+    }
+
+    async function readJsonResponse(response) {
+      const text = await response.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch (_) {
+        data = null;
+      }
+
+      if (!response.ok) {
+        const message = data?.error || data?.message || text || "Upload failed.";
+        throw new Error(message);
+      }
+
+      return data || {};
+    }
+
+    function startProgressWatcher(importId) {
+      if (progressWatcher && typeof progressWatcher.stop === "function") {
+        progressWatcher.stop();
+      }
+
+      let stopped = false;
+      let timer = null;
+
+      const stop = () => {
+        if (!stopped) {
+          if (timer) clearInterval(timer);
+          stopped = true;
+          progressWatcher = null;
+        }
+      };
+
+      const poll = async () => {
+        try {
+          const res = await fetch(`/progress/${encodeURIComponent(importId)}`);
+          const text = await res.text();
+          let snapshot = null;
+          try {
+            snapshot = text ? JSON.parse(text) : null;
+          } catch (_) {
+            snapshot = null;
+          }
+
+          if (!res.ok) {
+            const message = snapshot?.error || snapshot?.message || text || "Unable to fetch progress.";
+            throw new Error(message);
+          }
+
+          renderProgress(snapshot);
+
+          if (snapshot.status === "completed" || snapshot.status === "failed") {
+            stop();
+          }
+        } catch (err) {
+          stop();
+          statusBox.textContent += `\n⚠️ Progress check failed: ${err.message}`;
+        }
+      };
+
+      progressWatcher = { stop };
+      poll();
+      timer = setInterval(poll, 1000);
+    }
+
+    function renderProgress(snapshot) {
+      if (!snapshot) return;
+
+      const lines = [];
+      if (snapshot.tableName) {
+        lines.push(`Table: ${snapshot.tableName}`);
+      }
+      if (snapshot.id) {
+        lines.push(`Import ID: ${snapshot.id}`);
+      }
+      lines.push(`Status: ${formatStatus(snapshot.status)}`);
+
+      if (snapshot.totalRows) {
+        lines.push(`Processed: ${snapshot.processedRows} / ${snapshot.totalRows}`);
+      } else {
+        lines.push(`Processed: ${snapshot.processedRows}`);
+      }
+
+      if (typeof snapshot.percentage === "number") {
+        lines.push(`Progress: ${snapshot.percentage}%`);
+      }
+
+      if (snapshot.status === "completed" && snapshot.summary) {
+        lines.push("", "Summary:");
+        lines.push(`Processed Rows: ${snapshot.summary.processedRows}`);
+        lines.push(`Inserted/Updated: ${snapshot.summary.insertedOrUpdated}`);
+        lines.push(`Deleted Rows: ${snapshot.summary.deletedCount}`);
+        lines.push(`Skipped Rows: ${snapshot.summary.skippedRows}`);
+        if (snapshot.message) {
+          lines.push("", snapshot.message);
+        }
+      } else if (snapshot.status === "failed") {
+        if (snapshot.error) {
+          lines.push("", `Error: ${snapshot.error}`);
+        }
+      }
+
+      statusBox.textContent = lines.join("\n");
+    }
+
+    function formatStatus(status) {
+      switch (status) {
+        case "queued":
+          return "Queued";
+        case "importing":
+          return "Importing";
+        case "completed":
+          return "Completed";
+        case "failed":
+          return "Failed";
+        default:
+          return status || "Unknown";
+      }
     }
 
     function processAndUploadCSV(file, tableName) {
